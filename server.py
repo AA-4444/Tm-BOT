@@ -1,6 +1,7 @@
 # server.py
 # pip install fastapi uvicorn[standard] telethon asyncpg python-dotenv
-import os, asyncio, re, math
+
+import os, asyncio, re, math, logging
 from datetime import timezone, datetime, timedelta
 from typing import Optional
 
@@ -13,6 +14,10 @@ from telethon.errors import FloodWaitError
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel
 
+# ----- Логирование -----
+logging.basicConfig(level=logging.INFO)
+
+# ----- Конфиг -----
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION","")
@@ -21,6 +26,7 @@ PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
 
+# ----- SQL -----
 DDL = """
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
@@ -44,7 +50,6 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
--- полнотекст по-русски (можно добавить 'english')
 CREATE INDEX IF NOT EXISTS ix_msg_tsv ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
@@ -60,9 +65,8 @@ async def db():
     return _db_pool
 
 # ---------- УТИЛИТЫ ПОИСКА ----------
-# Синонимы/расширение запроса под нишу казино/фриспинов
 SYNONYMS = {
-    r"\bфри[-\s]?спин(ы|ов|ы|а)?\b": ["free spin", "free spins", "фриспин", "спины"],
+    r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины"],
     r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus"],
     r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код"],
     r"\bфриспины\b": ["free spins","спины"],
@@ -75,12 +79,10 @@ def expand_query(q: str) -> str:
     for pat, syns in SYNONYMS.items():
         if re.search(pat, ql):
             extra += syns
-    # склеиваем в простой запрос для plainto_tsquery
     if extra:
         q = q + " " + " ".join(set(extra))
     return q
 
-# Простейший классификатор «промо vs мем/шутка»
 PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп(озит)|депозит\s*бонус|%|крут(и|ить)\s*спины|акци(я|и)|розыгрыш|welcome)", re.I)
 PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
 
@@ -89,9 +91,7 @@ def is_promotional(text: str) -> bool:
     t = text.lower()
     return bool(PROMO_POS.search(t)) and not bool(PROMO_NEG.search(t))
 
-# Временное затухание: чем свежее, тем выше
 def recency_weight(date: datetime, now: datetime) -> float:
-    # полураспад ~30 дней: exp(-age/30)
     age_days = max(0.0, (now - date).total_seconds() / 86400.0)
     return math.exp(-age_days / 30.0)
 
@@ -125,6 +125,7 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
                 try:
                     chats = await discover(cli, q, limit_chats=40)
                 except FloodWaitError as e:
+                    logging.warning(f"FloodWait {e.seconds}s")
                     await asyncio.sleep(e.seconds + 5)
                     continue
 
@@ -142,7 +143,6 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
                     }
                     await upsert_channel(conn, meta["id"], meta["username"], meta["title"], meta["type"])
 
-                    # берём побольше свежих
                     async for msg in cli.iter_messages(ent, limit=limit_msgs):
                         text = msg.message or ""
                         row = {
@@ -158,34 +158,28 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
                         await upsert_message(conn, row)
 
 async def crawler_loop():
-    # сиды под нишу
     seeds = [
         "casino", "казино", "free spins", "фриспины",
         "бездепозитный бонус", "промокод казино", "азартные игры", "беттинг"
     ]
     while True:
         try:
-            await crawl_once(seeds, limit_msgs=1200)
+            logging.info("Crawler: starting cycle")
+            await crawl_once(seeds, limit_msgs=800)
+            logging.info("Crawler: done cycle")
         except Exception as e:
-            print("Crawler error:", e)
-        await asyncio.sleep(60*30)  # каждые 30 минут обновление
+            logging.error(f"Crawler error: {e}")
+        await asyncio.sleep(60*30)
 
 # ---------- API ----------
 @app.get("/search_messages")
-async def search_messages(
-    q: str = Query(..., min_length=2),
-    chat: Optional[str] = None,        # username канала для фильтра
-    days: int = 90,                    # по умолчанию свежак (90 дней)
-    only_promo: bool = True,           # отфильтровать мемы/шутки
-    limit: int = 20,
-    offset: int = 0,
-):
+async def search_messages(q: str = Query(..., min_length=2), chat: Optional[str] = None,
+                          days: int = 90, only_promo: bool = True,
+                          limit: int = 20, offset: int = 0):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
-
     pool = await db()
     async with pool.acquire() as conn:
-        # вытаскиваем кандидаты полнотекстом
         rows = await conn.fetch("""
         SELECT m.chat_id, c.username, c.title, m.message_id, m.date, m.text,
                ts_rank_cd(to_tsvector('russian', coalesce(m.text,'')),
@@ -200,7 +194,6 @@ async def search_messages(
         """, q2, since, chat)
 
     now = datetime.now(timezone.utc)
-    # пост-фильтр промо + пересчёт комбинированного скора
     items = []
     for r in rows:
         txt = r["text"] or ""
@@ -216,25 +209,16 @@ async def search_messages(
             "snippet": (txt[:280] + "…") if len(txt) > 280 else txt,
             "score": score
         })
-
     items.sort(key=lambda x: x["score"], reverse=True)
-    total = len(items)
-    items = items[offset:offset+limit]
-    return JSONResponse({"total": total, "items": items})
+    return JSONResponse({"total": len(items), "items": items[offset:offset+limit]})
 
 @app.get("/search_chats")
-async def search_chats(
-    q: str = Query(..., min_length=2),
-    days: int = 90,
-    only_promo: bool = True,
-    limit: int = 15
-):
+async def search_chats(q: str = Query(..., min_length=2), days: int = 90,
+                       only_promo: bool = True, limit: int = 15):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
-
     pool = await db()
     async with pool.acquire() as conn:
-        # собираем релевантность каналов по сумме очков сообщений
         rows = await conn.fetch("""
         WITH cand AS (
           SELECT m.chat_id, m.date, m.text,
@@ -257,7 +241,6 @@ async def search_chats(
     now = datetime.now(timezone.utc)
     out = []
     for r in rows:
-        # для простоты — свежесть канала = по последнему посту
         w = recency_weight(r["last_post"], now)
         base = float(r["hits"])
         score = base * 0.6 + w * 0.4
@@ -269,30 +252,20 @@ async def search_chats(
             "hits": r["hits"],
             "score": score
         })
-
-    # лёгкий промо-фильтр: проверим несколько последних сообщений канала
-    if only_promo:
-        # заберём по топ-каналам несколько последних сообщений и отфильтруем по is_promotional
-        out.sort(key=lambda x: x["score"], reverse=True)
-        out = out[:200]
-        filtered = []
-        async with pool.acquire() as conn:
-            for ch in out:
-                msgs = await conn.fetch("""
-                    SELECT text FROM messages WHERE chat_id=$1
-                    ORDER BY date DESC LIMIT 20
-                """, ch_id := (await conn.fetchval("SELECT chat_id FROM channels WHERE username=$1", ch["chat_username"])) if ch["chat_username"] else None)
-                if any(is_promotional((m["text"] or "")) for m in msgs):
-                    filtered.append(ch)
-        out = filtered
-
     out.sort(key=lambda x: x["score"], reverse=True)
     return JSONResponse({"total": len(out), "items": out[:limit]})
 
 # ----------- ENTRYPOINT -----------
+async def check_session():
+    async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
+        me = await cli.get_me()
+        logging.info(f"MTProto OK. Logged in as: {me.first_name} (bot={getattr(me,'bot',False)})")
+
 async def main():
     import uvicorn
     loop = asyncio.get_running_loop()
+    await check_session()
+    logging.info("Starting crawler loop…")
     loop.create_task(crawler_loop())
     config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")))
     server = uvicorn.Server(config)

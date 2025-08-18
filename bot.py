@@ -1,8 +1,11 @@
 # bot.py
 # pip install aiogram httpx python-dotenv
-import os, re, asyncio, httpx
+
+import os, re, asyncio, logging, httpx
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN","")
 API_BASE = os.getenv("SEARCH_API_URL","http://localhost:8000")  # без /search
@@ -26,8 +29,7 @@ async def start(m: types.Message):
 
 @dp.message(Command("search"))
 async def search_cmd(m: types.Message):
-    raw = m.text
-    parts = raw.split(maxsplit=1)
+    parts = m.text.split(maxsplit=1)
     if len(parts) == 1:
         return await m.answer("Пример: /search бесплатные фриспины days:60")
     query = parts[1]
@@ -74,4 +76,12 @@ async def channels_cmd(m: types.Message):
     await m.answer("\n".join(lines))
 
 if __name__ == "__main__":
-    asyncio.run(dp.start_polling(bot))
+    async def runner():
+        if not BOT_TOKEN or not API_BASE:
+            logging.error("❌ Bot config missing: BOT_TOKEN/SEARCH_API_URL")
+            return
+        await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Bot polling started")
+        await dp.start_polling(bot)
+
+    asyncio.run(runner())
