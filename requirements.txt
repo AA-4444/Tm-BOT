@@ -5,3 +5,5 @@ asyncpg
 aiogram
 httpx
 python-dotenv
+aiogram==3.7.0
+httpx
