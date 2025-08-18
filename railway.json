@@ -1,0 +1,17 @@
+{
+  "build": { "builder": "NIXPACKS" },
+  "services": [
+    {
+      "name": "tg-search-api",
+      "startCommand": "python server.py",
+      "envVars": [
+        { "key": "PORT", "value": "8000" }
+      ]
+    },
+    {
+      "name": "tg-search-bot",
+      "startCommand": "python bot.py",
+      "restartPolicyType": "ON_FAILURE"
+    }
+  ]
+}

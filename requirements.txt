@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+telethon
+asyncpg
+aiogram
+httpx
+python-dotenv
