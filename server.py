@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 import asyncpg
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RpcError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel
 
@@ -155,7 +155,7 @@ async def _fetch_channel(cli, conn, ch, limit_msgs: int, sem: asyncio.Semaphore)
     async with sem:
         try:
             ent = await cli.get_entity(ch)
-        except RpcError:
+        except RPCError:
             return
         meta = {
             "id": ent.id,
@@ -206,8 +206,8 @@ async def crawl_once(seeds: list[str], limit_msgs_new: int = 3000, limit_msgs_kn
                     logging.warning(f"FloodWait {e.seconds}s on discover")
                     await asyncio.sleep(e.seconds + 5)
                     continue
-                except RpcError:
-                    continue
+                except RPCError:
+                     continue
 
                 # параллельный сбор новых каналов
                 tasks = []
