@@ -1,6 +1,9 @@
 # server.py
 # deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
-
+import os, sys
+if os.getenv("ROLE") and os.getenv("ROLE") != "server":
+    sys.exit("API: ROLE != server → выходим")
+    
 import os, asyncio, re, math, logging
 from datetime import timezone, datetime, timedelta
 from typing import Optional, List

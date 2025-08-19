@@ -1,7 +1,10 @@
 # bot.py
 # deps: aiogram==3.7.0 httpx
+import os, sys
+if os.getenv("ROLE") and os.getenv("ROLE") != "bot":
+    sys.exit("BOT: ROLE != bot → выходим")
 
-import os, re, asyncio, logging, httpx
+import re, asyncio, logging, httpx
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
