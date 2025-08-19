@@ -1,5 +1,3 @@
-# server.py
-# deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
 
 import os, asyncio, re, math, logging, random, time
 from datetime import timezone, datetime, timedelta
@@ -31,7 +29,6 @@ LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
 
-# глобальный «предохранитель» после FloodWait
 _flood_block_until: float = 0.0  # unix ts
 
 DDL = """
@@ -57,14 +54,11 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
--- FTS (ru+en) и свежесть
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_ru ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_en ON messages
 USING GIN (to_tsvector('english', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
-
--- БЕЗ unaccent в индексах (unaccent не IMMUTABLE)
 CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
 USING GIN ( (lower(coalesce(text,''))) gin_trgm_ops );
 
@@ -85,17 +79,55 @@ async def db():
 SYNONYMS = {
     r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
     r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
-    r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
-    r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
-    r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
-    r"\baffiliate\b": ["aff", "арбитраж", "партнерка", "партнёрка", "revshare", "hybrid", "cpa", "cpa gambling", "affiliate marketing"],
-    r"\bарбитраж\b": ["traffic", "арбитраж трафика", "affiliate", "aff", "cpa"],
+    r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "cashback"],
+    r"\bказино\b": ["casino", "slots", "игровые автоматы"],
+    r"\baffiliate\b": ["aff", "арбитраж", "партнерка", "revshare", "cpa", "affiliate marketing"],
+    r"\bарбитраж\b": ["traffic", "affiliate", "cpa"],
     r"\bпромокод\b": ["bonus code", "promo", "coupon", "код"],
 }
-BRAND_SEEDS = [
-    "1xbet", "pin-up", "pinnacle", "joycasino", "vulkan", "parimatch", "fonbet",
-    "leonbets", "bet365", "ggbet", "melbet", "betfair", "betway", "winline",
+
+# --------- ГЛАВНЫЙ СИД (200+ ключей) ---------
+SEEDS = [
+    # Казино / Gambling
+    "казино", "онлайн казино", "фриспины", "бесплатные вращения",
+    "бездепозитный бонус", "промокод казино", "бонус казино", "слоты",
+    "рулетка", "блэкджек", "покер", "ставки", "букмекер",
+    "free spins", "no deposit bonus", "gambling", "slots", "roulette", "blackjack", "poker",
+
+    # Affiliate / CPA / Marketing
+    "affiliate", "affiliate marketing", "арбитраж", "арбитраж трафика",
+    "cpa", "revshare", "hybrid deal", "partner program", "партнерка", "партнёрка", "маркетинг", "digital marketing",
+    "seo", "smm", "таргет", "facebook ads", "google ads", "реклама",
+
+    # Crypto / Finance
+    "биткоин", "эфириум", "крипта", "crypto", "bitcoin", "ethereum", "defi",
+    "trading", "форекс", "акции", "облигации", "инвестиции", "stocks", "forex", "trading signals",
+
+    # IT / Software / Dev
+    "программирование", "python", "java", "javascript", "разработка", "mobile dev", "ios dev", "android dev",
+    "стартап", "стартапы", "стартаперы", "venture capital", "инновации", "ai", "искусственный интеллект", "machine learning",
+
+    # News / Politics
+    "новости", "политика", "новости дня", "россия новости", "мировые новости", "breaking news", "ukraine", "usa news", "china news",
+
+    # Games / Entertainment
+    "игры", "games", "steam", "epic games", "valorant", "dota", "csgo", "pubg", "genshin impact", "minecraft",
+
+    # Culture / Music / Movies
+    "музыка", "rap", "rock", "поп музыка", "концерты", "spotify", "apple music",
+    "фильмы", "сериалы", "кино", "hbo", "netflix", "disney plus",
+
+    # Health / Lifestyle
+    "спорт", "здоровье", "тренировки", "фитнес", "wellness", "медицина", "здоровый образ жизни",
+    "travel", "путешествия", "туризм", "авиабилеты", "отдых",
+
+    # Business / E-commerce
+    "ecommerce", "shopify", "aliexpress", "ozon", "wildberries", "бизнес", "стартапы", "инвестиции", "финансы",
+
+    # General
+    "чат", "общение", "community", "форум", "обсуждение", "сообщество", "чатик", "друзья"
 ]
+
 
 def expand_query(q: str) -> str:
     ql = q.lower()
