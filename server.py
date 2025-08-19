@@ -1,4 +1,7 @@
-import os, asyncio, re, math, logging, random
+# server.py
+# deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
+
+import os, asyncio, re, math, logging, random, time
 from datetime import timezone, datetime, timedelta
 from typing import Optional, Iterable
 
@@ -14,15 +17,22 @@ from telethon.tl.types import Channel
 
 logging.basicConfig(level=logging.INFO)
 
+# -------- ENV --------
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
 STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION","")
 PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
 
-RUN_CRAWLER = os.getenv("RUN_CRAWLER","0") in ("1","true","yes")
+RUN_CRAWLER = os.getenv("RUN_CRAWLER","0").lower() in ("1","true","yes")
+LIVE_MAX_CHATS = int(os.getenv("LIVE_MAX_CHATS", "100"))
+LIVE_PER_CHANNEL_LIMIT = int(os.getenv("LIVE_PER_CHANNEL_LIMIT", "220"))
+LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
+
+# глобальный «предохранитель» после FloodWait
+_flood_block_until: float = 0.0  # unix ts
 
 DDL = """
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -54,7 +64,7 @@ CREATE INDEX IF NOT EXISTS ix_msg_tsv_en ON messages
 USING GIN (to_tsvector('english', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
 
--- ВАЖНО: без unaccent в индексе (unaccent не IMMUTABLE)
+-- БЕЗ unaccent в индексах (unaccent не IMMUTABLE)
 CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
 USING GIN ( (lower(coalesce(text,''))) gin_trgm_ops );
 
@@ -99,7 +109,6 @@ def expand_query(q: str) -> str:
 
 PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп(озит)|депозит\s*бонус|welcome|фриспин|cash\s*back|кэшбек|промо)", re.I)
 PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
-
 SPAM_NEG = re.compile(
     r"(free\s*movies?|tv\s*shows?|stream|прям(ая|ые)\s*трансляц|расписани[ея]|schedule|fixtures|"
     r"live\s*score|match|vs\s|лига|серия\s*a|серия\s*b|кубак?|epl|la\s*liga|bundesliga|"
@@ -161,13 +170,22 @@ async def upsert_message(conn, row):
     """, row["chat_id"], row["message_id"], row["date"], row["text"], row["has_media"],
          row["links"], row["views"], row["forwards"])
 
+def _flood_blocked() -> bool:
+    return time.time() < _flood_block_until
+
+def _set_flood_block(seconds: int):
+    global _flood_block_until
+    _flood_block_until = time.time() + max(5, seconds)
+
 async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
+    if _flood_blocked():
+        return []
     try:
         res = await cli(SearchRequest(q=query, limit=limit))
     except FloodWaitError as e:
         logging.warning(f"FloodWait {e.seconds}s on SearchRequest")
-        await asyncio.sleep(e.seconds + 2)
-        res = await cli(SearchRequest(q=query, limit=min(20, limit)))
+        _set_flood_block(e.seconds)
+        return []
     except RPCError:
         return []
     return channels_only(res.chats)
@@ -217,7 +235,9 @@ async def crawl_once(seeds: list[str], per_channel: int = 500):
             seeded = list(dict.fromkeys(seeds + BRAND_SEEDS))
             random.shuffle(seeded)
             for q in seeded:
-                chans = await live_find_channels(cli, q, limit=120)
+                chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 120))
+                if not chans:
+                    continue
                 await live_backfill_messages(cli, conn, chans, days=365, per_channel=per_channel)
 
 async def crawler_loop():
@@ -261,7 +281,7 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
       SELECT m.chat_id, m.message_id, m.date, m.text,
              m.views, m.forwards,
              c.username, c.title,
-             lower(regexp_replace(unaccent(coalesce(m.text,'')), '\s+', ' ', 'g')) AS norm
+             lower(regexp_replace(coalesce(m.text,''), '\\s+', ' ', 'g')) AS norm
       FROM messages m
       JOIN channels c USING(chat_id)
       WHERE m.date >= $2
@@ -332,7 +352,8 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
 
 async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, toks: list[str],
                           only_promo: bool, no_spam: bool, limit: int):
-    rows = await conn.fetch(r"""
+    # 1) По сообщениями
+    rows_msg = await conn.fetch(r"""
     WITH cand AS (
       SELECT m.chat_id, m.date, m.text, m.views, m.forwards
       FROM messages m
@@ -369,21 +390,52 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     LIMIT 800
     """, q2, since, toks, only_public)
 
-    now = datetime.now(timezone.utc)
-    out = []
-    for r in rows:
-        ch_url, _ = make_links(r["username"], None)
-        score = float(r["hits"]) * 0.45 + recency_weight(r["last_post"], now) * 0.35 + log1p(r["views_sum"]) * 0.12 + log1p(r["fw_sum"]) * 0.08
-        out.append({
-            "chat": r["username"] or r["title"],
-            "chat_username": r["username"],
-            "channel_url": ch_url,
-            "title": r["title"],
-            "last_post": r["last_post"].isoformat() if r["last_post"] else None,
-            "hits": r["hits"],
-            "score": score
-        })
+    # 2) По названию/username канала (каналы без/с малым числом постов)
+    rows_meta = await conn.fetch(r"""
+    SELECT chat_id, username, title, NOW()::timestamptz AS last_post,
+           0::bigint AS hits, 0::bigint AS views_sum, 0::bigint AS fw_sum
+    FROM channels
+    WHERE
+      (to_tsvector('simple', coalesce(username,'') || ' ' || coalesce(title,'')) @@
+       (plainto_tsquery('simple', $1) || websearch_to_tsquery('simple', $1)))
+      OR lower(coalesce(username,'')) ILIKE '%'||lower($1)||'%'
+      OR lower(coalesce(title,'')) ILIKE '%'||lower($1)||'%'
+    LIMIT 400
+    """, q2)
 
+    # склеим, проставим скор
+    now = datetime.now(timezone.utc)
+    out_map = {}
+
+    def put_row(chat_id, username, title, last_post, hits, views_sum, fw_sum, meta_boost=False):
+        ch_url, _ = make_links(username, None)
+        score = (
+            float(hits) * 0.45 +
+            recency_weight(last_post, now) * 0.35 +
+            log1p(views_sum) * 0.12 +
+            log1p(fw_sum) * 0.08 +
+            (0.3 if meta_boost else 0.0)  # лёгкий буст чисто за мету
+        )
+        out_map[chat_id] = {
+            "chat": username or title,
+            "chat_username": username,
+            "channel_url": ch_url,
+            "title": title,
+            "last_post": last_post.isoformat() if last_post else None,
+            "hits": int(hits),
+            "score": float(score)
+        }
+
+    for r in rows_msg:
+        put_row(r["chat_id"], r["username"], r["title"], r["last_post"], r["hits"], r["views_sum"], r["fw_sum"], meta_boost=False)
+
+    for r in rows_meta:
+        if r["chat_id"] not in out_map:
+            put_row(r["chat_id"], r["username"], r["title"], r["last_post"], r["hits"], r["views_sum"], r["fw_sum"], meta_boost=True)
+
+    out = list(out_map.values())
+
+    # фильтры промо/спам по последним 30 сообщениям, если нужно
     if only_promo or no_spam:
         filtered = []
         for ch in out:
@@ -417,6 +469,28 @@ async def status():
         last_dt = await conn.fetchval("SELECT max(date) FROM messages")
     return {"channels": ch_cnt, "messages": msg_cnt, "last_message_at": last_dt.isoformat() if last_dt else None}
 
+@app.get("/push_channels")
+async def push_channels(usernames: str = Query(..., description="comma-separated usernames"), days: int = 180, per: int = 300):
+    """Ручное расширение: подтянуть список @usernames (через запятую) и закешировать посты"""
+    us = [u.strip().lstrip("@") for u in usernames.split(",") if u.strip()]
+    if not us:
+        return {"ok": False, "error": "no usernames"}
+    pool = await db()
+    async with pool.acquire() as conn:
+        async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
+            chans: list[Channel] = []
+            for uname in us:
+                try:
+                    ent = await cli.get_entity(uname)
+                    if isinstance(ent, Channel):
+                        chans.append(ent)
+                except RPCError:
+                    continue
+            if not chans:
+                return {"ok": True, "added": 0}
+            await live_backfill_messages(cli, conn, chans, days=days, per_channel=per)
+    return {"ok": True, "added": len(chans)}
+
 @app.get("/search_messages")
 async def search_messages(
     q: str = Query(..., min_length=2),
@@ -436,20 +510,23 @@ async def search_messages(
 
     pool = await db()
     async with pool.acquire() as conn:
-        if live:
+        if live and not _flood_blocked():
             try:
                 async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
-                    chans = await live_find_channels(cli, q, limit=80)
+                    chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 100))
                     if not chans:
+                        # Расширим запросы — базовый q, развернутый q2 и бренды
                         widened = list(dict.fromkeys([q] + [q2] + BRAND_SEEDS))
                         random.shuffle(widened)
                         for wq in widened[:4]:
                             cs = await live_find_channels(cli, wq, limit=40)
                             chans += cs
-                            if len(chans) >= 80:
+                            if len(chans) >= LIVE_MAX_CHATS:
                                 break
                     if chans:
-                        await live_backfill_messages(cli, conn, chans[:80], days=days, per_channel=220)
+                        await live_backfill_messages(cli, conn, chans[:LIVE_MAX_CHATS], days=days, per_channel=LIVE_PER_CHANNEL_LIMIT)
+            except FloodWaitError as e:
+                _set_flood_block(e.seconds)
             except Exception as e:
                 logging.warning(f"Live phase failed: {e}")
 
@@ -474,38 +551,18 @@ async def search_chats(
 
     pool = await db()
     async with pool.acquire() as conn:
-        live_list = []
-        if live:
+        if live and not _flood_blocked():
             try:
                 async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
-                    chans = await live_find_channels(cli, q, limit=100)
+                    chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 120))
                     if chans:
-                        await live_backfill_messages(cli, conn, chans[:100], days=days, per_channel=200)
-                        for ch in chans:
-                            ch_url, _ = make_links(getattr(ch,"username",None), None)
-                            live_list.append({
-                                "chat": getattr(ch,"username",None) or getattr(ch,"title",None),
-                                "chat_username": getattr(ch,"username",None),
-                                "channel_url": ch_url,
-                                "title": getattr(ch,"title",None),
-                                "last_post": None,
-                                "hits": 0,
-                                "score": 0.0
-                            })
+                        await live_backfill_messages(cli, conn, chans[:LIVE_MAX_CHATS], days=days, per_channel=LIVE_KNOWN_PER_CHANNEL)
+            except FloodWaitError as e:
+                _set_flood_block(e.seconds)
             except Exception as e:
                 logging.warning(f"Live channels failed: {e}")
 
         res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit)
-        if res["total"] < limit and live_list:
-            have = set((it["chat_username"], it["title"]) for it in res["items"])
-            for it in live_list:
-                key = (it["chat_username"], it["title"])
-                if key not in have:
-                    res["items"].append(it)
-                    have.add(key)
-                if len(res["items"]) >= limit:
-                    break
-            res["total"] = len(res["items"])
         return JSONResponse(res)
 
 # ----------- ENTRYPOINT -----------
