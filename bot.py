@@ -1,22 +1,24 @@
 # bot.py
 # pip install aiogram==3.7.0 httpx
-import os, re, asyncio, logging, httpx, time
-from aiogram import Bot, Dispatcher, types
+
+import os, re, asyncio, logging, httpx
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 
 logging.basicConfig(level=logging.INFO)
-print("🔧 Booting bot.py...")  # очень ранний лог в stdout
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-API_BASE  = os.getenv("SEARCH_API_URL", "")
+API_BASE = os.getenv("SEARCH_API_URL", "http://localhost:8000")
 
-# Ранние проверки переменных с явными логами
-if not BOT_TOKEN:
-    print("❌ BOT_TOKEN is missing in environment")
-if not API_BASE:
-    print("❌ SEARCH_API_URL is missing in environment")
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
 
+# ---------- утилиты ----------
 def esc(s: str) -> str:
     return re.sub(r"[<>&]", lambda m: {"<":"&lt;",">":"&gt;","&":"&amp;"}[m.group(0)], s or "")
 
@@ -24,87 +26,111 @@ def parse_days(s: str, default=60):
     m = re.search(r"days:(\d+)", s)
     return int(m.group(1)) if m else default
 
-# Если нет конфига — не выходим молча, а оставляем процесс живым с логом
-if not BOT_TOKEN or not API_BASE:
-    print("⏸ Bot not configured. Waiting here so you can see logs...")
-    try:
-        while True:
-            time.sleep(30)
-    except KeyboardInterrupt:
-        pass
-    raise SystemExit(1)
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔍 Поиск сообщений")],
+        [KeyboardButton(text="📣 Поиск каналов")],
+        [KeyboardButton(text="ℹ️ Помощь")]
+    ],
+    resize_keyboard=True
+)
 
-# Инициализация бота под aiogram 3.7.0+
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
-
+# ---------- команды ----------
 @dp.message(Command("start"))
 async def start(m: types.Message):
     await m.answer(
-        "🔍 Поиск по казино-нишe.\n"
-        "Команды:\n"
-        "• /search <запрос> [days:60]\n"
-        "• /channels <запрос> [days:60]"
+        "👋 Привет! Я помогу искать промо-посты и каналы в казино-нишe.\n\n"
+        "Выбери действие кнопкой ниже 👇",
+        reply_markup=main_kb
     )
 
-@dp.message(Command("search"))
-async def search_cmd(m: types.Message):
-    parts = m.text.split(maxsplit=1)
-    if len(parts) == 1:
-        return await m.answer("Пример: /search бесплатные фриспины days:60")
-    query = parts[1]
-    days = parse_days(query)
-    query = re.sub(r"days:\d+","",query).strip()
+@dp.message(Command("help"))
+async def help_cmd(m: types.Message):
+    await m.answer(
+        "ℹ️ <b>Как пользоваться:</b>\n\n"
+        "• Нажми <b>🔍 Поиск сообщений</b> и введи ключевые слова\n"
+        "  (например: <i>бесплатные фриспины</i>).\n\n"
+        "• Нажми <b>📣 Поиск каналов</b> и введи тематику\n"
+        "  (например: <i>казино бонус</i>).\n\n"
+        "Дополнительно можно указать диапазон дней:\n"
+        "<code>days:90</code> — искать посты за последние 90 дней."
+    )
 
-    params = {"q": query, "days": days, "only_promo": "true", "limit": 8}
-    async with httpx.AsyncClient(timeout=25) as cli:
+# ---------- логика поиска ----------
+async def search_messages(query: str, days: int = 60):
+    params = {"q": query, "days": days, "only_promo": "true", "only_public": "true", "no_spam": "true", "limit": 6}
+    async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.get(f"{API_BASE}/search_messages", params=params)
         r.raise_for_status()
-        data = r.json()
+        return r.json().get("items", [])
 
-    if not data.get("items"):
-        return await m.answer("❌ Ничего свежего не найдено. Попробуй изменить запрос или увеличить days.")
-
-    lines = []
-    for it in data["items"]:
-        title = it["chat"] or "unknown"
-        date  = it["date"][:10]
-        snippet = it["snippet"]
-        lines.append(f"🧭 <b>{esc(title)}</b>  <i>{esc(date)}</i>\n{esc(snippet)}")
-
-    await m.answer("\n\n".join(lines))
-
-@dp.message(Command("channels"))
-async def channels_cmd(m: types.Message):
-    parts = m.text.split(maxsplit=1)
-    if len(parts) == 1:
-        return await m.answer("Пример: /channels бездепозитный бонус days:90")
-    query = parts[1]
-    days = parse_days(query, default=90)
-    query = re.sub(r"days:\d+","",query).strip()
-
-    params = {"q": query, "days": days, "only_promo": "true", "limit": 10}
-    async with httpx.AsyncClient(timeout=25) as cli:
+async def search_chats(query: str, days: int = 90):
+    params = {"q": query, "days": days, "only_promo": "true", "only_public": "true", "no_spam": "true", "limit": 8}
+    async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.get(f"{API_BASE}/search_chats", params=params)
         r.raise_for_status()
-        data = r.json()
+        return r.json().get("items", [])
 
-    if not data.get("items"):
-        return await m.answer("❌ Каналы не найдены. Попробуй другой запрос или увеличь days.")
+# ---------- обработчики кнопок ----------
+@dp.message(F.text == "🔍 Поиск сообщений")
+async def ask_msg_query(m: types.Message):
+    await m.answer("Введи запрос для поиска сообщений.\n\nНапример: <code>фриспины days:60</code>")
 
-    lines = []
-    for ch in data["items"]:
-        name = ch["chat_username"] or ch["title"] or "channel"
-        last = ch["last_post"][:10] if ch["last_post"] else "—"
-        lines.append(f"📣 <b>{esc(name)}</b>  (посл. пост: {esc(last)})  · hits: {ch['hits']}")
+@dp.message(F.text == "📣 Поиск каналов")
+async def ask_channel_query(m: types.Message):
+    await m.answer("Введи запрос для поиска каналов.\n\nНапример: <code>бонус казино days:120</code>")
 
-    await m.answer("\n".join(lines))
+@dp.message(F.text == "ℹ️ Помощь")
+async def show_help(m: types.Message):
+    await help_cmd(m)
 
+# ---------- обработка «свободного текста» ----------
+@dp.message()
+async def handle_text(m: types.Message):
+    txt = m.text.strip()
+    if not txt:
+        return
+    days = parse_days(txt, default=60)
+    query = re.sub(r"days:\d+","",txt).strip()
+
+    # пробуем сначала поиск сообщений
+    items = await search_messages(query, days)
+    if items:
+        lines = []
+        for it in items:
+            title = it["chat"] or it.get("chat_username") or "channel"
+            date  = it["date"][:10]
+            ch_url, msg_url = it.get("channel_url"), it.get("message_url")
+            snippet = esc(it["snippet"])
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔗 Открыть пост", url=msg_url)]] if msg_url else []
+            )
+            header = f"🧭 <b>{esc(title)}</b>  <i>{esc(date)}</i>"
+            await m.answer(f"{header}\n{snippet}", reply_markup=kb)
+        return
+
+    # если нет сообщений → пробуем поиск каналов
+    channels = await search_chats(query, days)
+    if channels:
+        for ch in channels:
+            title = ch["title"] or ch["chat"] or "channel"
+            last = ch["last_post"][:10] if ch["last_post"] else "—"
+            url = ch.get("channel_url")
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📣 Перейти в канал", url=url)]] if url else []
+            )
+            await m.answer(f"📣 <b>{esc(title)}</b>\nпосл. пост: <i>{esc(last)}</i>\nсообщений: {ch['hits']}", reply_markup=kb)
+        return
+
+    await m.answer("❌ Ничего не найдено. Попробуй другой запрос или увеличь days.")
+
+# ---------- entrypoint ----------
 if __name__ == "__main__":
     async def runner():
-        # На всякий случай выключим вебхук (если вдруг был)
+        if not BOT_TOKEN:
+            logging.error("❌ BOT_TOKEN отсутствует")
+            return
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("✅ Bot polling started")
         await dp.start_polling(bot)
-
     asyncio.run(runner())
