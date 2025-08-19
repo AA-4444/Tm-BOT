@@ -1,7 +1,7 @@
 # server.py
-# pip install fastapi uvicorn[standard] telethon asyncpg python-dotenv
+# deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
 
-import os, asyncio, re, math, logging, hashlib
+import os, asyncio, re, math, logging
 from datetime import timezone, datetime, timedelta
 from typing import Optional
 
@@ -16,10 +16,10 @@ from telethon.tl.types import Channel
 
 logging.basicConfig(level=logging.INFO)
 
-API_ID  = int(os.getenv("API_ID","0"))
-API_HASH = os.getenv("API_HASH","")
-STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION","")
-PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
+API_ID  = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
+PG_DSN = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
@@ -79,11 +79,9 @@ def expand_query(q: str) -> str:
         q = q + " " + " ".join(sorted(set(extra)))
     return q
 
-# промо/непромо
 PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп(озит)|депозит\s*бонус|welcome|фриспин|кэшбек|cash\s*back)", re.I)
 PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
 
-# «мусор» для казино-задачи (стримы, расписания матчей, фильмы, чисто спорт)
 SPAM_NEG = re.compile(
     r"(free\s*movies?|tv\s*shows?|stream|прям(ая|ые)\s*трансляц|расписани[ея]|schedule|fixtures|"
     r"live\s*score|match|vs\s|лига|серия\s*a|серия\s*b|кубак?|epl|la\s*liga|bundesliga|"
@@ -104,13 +102,6 @@ def recency_weight(date: datetime, now: datetime) -> float:
     age_days = max(0.0, (now - date).total_seconds() / 86400.0)
     return math.exp(-age_days / 30.0)
 
-def normalize_text(s: str) -> str:
-    if not s: return ""
-    s = s.lower()
-    s = re.sub(r"[\u2600-\u27BF\u1F300-\u1FAFF]", " ", s)  # уберём эмодзи (грубо)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
 # ---------- краулер ----------
 async def upsert_channel(conn, chat_id, username, title, typ):
     await conn.execute("""
@@ -128,7 +119,8 @@ async def upsert_message(conn, row):
     """, row["chat_id"], row["message_id"], row["date"], row["text"], row["has_media"],
          row["links"], row["views"], row["forwards"])
 
-async def discover(client, query: str, limit_chats=40):
+async def discover(client, query: str, limit_chats=200):
+    # больше каналов за проход
     res = await client(SearchRequest(q=query, limit=limit_chats))
     return [c for c in res.chats if isinstance(c, Channel) and getattr(c, 'username', None)]
 
@@ -139,14 +131,14 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
             seen = set()
             for q in seeds:
                 try:
-                    chats = await discover(cli, q, limit_chats=40)
+                    chats = await discover(cli, q, limit_chats=200)
                 except FloodWaitError as e:
                     logging.warning(f"FloodWait {e.seconds}s")
                     await asyncio.sleep(e.seconds + 5)
                     continue
 
                 for ch in chats:
-                    if ch.id in seen: 
+                    if ch.id in seen:
                         continue
                     seen.add(ch.id)
 
@@ -175,9 +167,11 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
 
 async def crawler_loop():
     seeds = [
-        "casino", "казино", "free spins", "фриспины",
-        "бездепозитный бонус", "промокод казино", "бонус казино", "бесплатные вращения",
-        "слоты", "slots"
+        "casino", "казино", "free spins", "фриспины", "бесплатные вращения",
+        "бездепозитный бонус", "промокод казино", "бонус казино",
+        "слоты", "slots",
+        "рулетка", "blackjack", "покер",
+        "affiliate marketing", "affiliate casino", "cpa gambling", "арбитраж трафика", "партнерка казино"
     ]
     while True:
         try:
@@ -212,32 +206,39 @@ async def search_messages(
 
     pool = await db()
     async with pool.acquire() as conn:
-        # 1) кандидаты по полнотексту, 2) нормализованный текст, 3) хэш для дедупа
         rows = await conn.fetch("""
         WITH m2 AS (
           SELECT m.chat_id, m.message_id, m.date, m.text,
                  c.username, c.title,
-                 lower(regexp_replace(unaccent(coalesce(m.text,'')), '\s+', ' ', 'g')) AS norm
+                 lower(regexp_replace(unaccent(coalesce(m.text,'')), '\\s+', ' ', 'g')) AS norm
           FROM messages m
           JOIN channels c USING(chat_id)
           WHERE m.date >= $2
-            AND to_tsvector('russian', coalesce(m.text,'')) @@ plainto_tsquery('russian', $1)
             AND ($3::text IS NULL OR lower(c.username)=lower($3))
             AND ($4::bool IS FALSE OR c.username IS NOT NULL)
+            AND (
+              to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
+                 || websearch_to_tsquery('russian', $1))
+              OR
+              to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
+                 || websearch_to_tsquery('english', $1))
+              OR
+              similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.25
+            )
         ),
         scored AS (
           SELECT m2.*,
-                 ts_rank_cd(to_tsvector('russian', coalesce(m2.text,'')),
-                            plainto_tsquery('russian', $1)) AS ft_score,
+                 ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.7
+                   + similarity(lower(unaccent(coalesce(m2.text,''))), lower(unaccent($1))) * 0.3
+                   AS ft_score,
                  md5(m2.norm) AS norm_hash
           FROM m2
         )
-        -- DISTINCT ON убирает дубликаты одинаковых текстов внутри одного канала
         SELECT DISTINCT ON (chat_id, norm_hash)
-               chat_id, username, title, message_id, date, text, ft_score, norm_hash
+               chat_id, username, title, message_id, date, text, ft_score
         FROM scored
         ORDER BY chat_id, norm_hash, date DESC
-        LIMIT 600
+        LIMIT 700
         """, q2, since, chat, only_public)
 
     now = datetime.now(timezone.utc)
@@ -283,12 +284,18 @@ async def search_chats(
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
         WITH cand AS (
-          SELECT m.chat_id, m.date, m.text,
-                 ts_rank_cd(to_tsvector('russian', coalesce(m.text,'')),
-                            plainto_tsquery('russian', $1)) AS ft_score
+          SELECT m.chat_id, m.date, m.text
           FROM messages m
           WHERE m.date >= $2
-            AND to_tsvector('russian', coalesce(m.text,'')) @@ plainto_tsquery('russian', $1)
+            AND (
+              to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
+                 || websearch_to_tsquery('russian', $1))
+              OR
+              to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
+                 || websearch_to_tsquery('english', $1))
+              OR
+              similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.25
+            )
         ),
         agg AS (
           SELECT c.chat_id, c.username, c.title,
@@ -302,7 +309,7 @@ async def search_chats(
         FROM agg
         WHERE ($3::bool IS FALSE OR username IS NOT NULL)
         ORDER BY last_post DESC
-        LIMIT 300
+        LIMIT 400
         """, q2, since, only_public)
 
     now = datetime.now(timezone.utc)
@@ -319,15 +326,14 @@ async def search_chats(
             "score": float(r["hits"]) * 0.6 + recency_weight(r["last_post"], now) * 0.4
         })
 
-    # лёгкая промо/анти-спам фильтрация по последним сообщениям канала
     if only_promo or no_spam:
         filtered = []
-        async with pool.acquire() as conn:
+        async with pool.acquire() as conn2:
             for ch in out:
                 if not ch["chat_username"]:
                     continue
-                ch_id = await conn.fetchval("SELECT chat_id FROM channels WHERE username=$1", ch["chat_username"])
-                msgs = await conn.fetch("""
+                ch_id = await conn2.fetchval("SELECT chat_id FROM channels WHERE username=$1", ch["chat_username"])
+                msgs = await conn2.fetch("""
                     SELECT text FROM messages WHERE chat_id=$1
                     ORDER BY date DESC LIMIT 30
                 """, ch_id)
