@@ -47,16 +47,16 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
--- Индексы для FTS и свежести
+-- FTS (ru+en) и свежесть
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_ru ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_en ON messages
 USING GIN (to_tsvector('english', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
 
--- Триграммы (similarity/ILIKE ускорение)
+-- ВАЖНО: без unaccent в индексе (unaccent не IMMUTABLE)
 CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
-USING GIN ( (lower(unaccent(coalesce(text,'')))) gin_trgm_ops );
+USING GIN ( (lower(coalesce(text,''))) gin_trgm_ops );
 
 CREATE INDEX IF NOT EXISTS ix_chan_name_ru ON channels
 USING GIN (to_tsvector('russian', coalesce(title,'')));
@@ -162,7 +162,6 @@ async def upsert_message(conn, row):
          row["links"], row["views"], row["forwards"])
 
 async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
-    """Найти публичные каналы по запросу прямо в Telegram."""
     try:
         res = await cli(SearchRequest(q=query, limit=limit))
     except FloodWaitError as e:
@@ -174,7 +173,6 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
     return channels_only(res.chats)
 
 async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Channel], days: int, per_channel: int = 250):
-    """Быстро подтянуть последние сообщения каналов за N дней и положить в БД."""
     since_dt = datetime.now(timezone.utc) - timedelta(days=max(1, days))
     sem = asyncio.Semaphore(6)
 
@@ -242,7 +240,7 @@ async def crawler_loop():
             logging.error(f"Crawler error: {e}")
         await asyncio.sleep(60*30)
 
-# ---------------- API core (DB query) ----------------
+# ---------------- Core: DB search helpers ----------------
 def _diversify(items: list[dict], max_per_channel: int = 3) -> list[dict]:
     seen = {}
     out = []
@@ -276,18 +274,18 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
           to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
              || websearch_to_tsquery('english', $1))
           OR
-          similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.20
+          similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
           OR
           EXISTS (
             SELECT 1 FROM unnest($5::text[]) AS t
-            WHERE lower(unaccent(coalesce(m.text,''))) ILIKE ('%'||t||'%')
+            WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
           )
         )
     ),
     scored AS (
       SELECT m2.*,
              ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
-               + similarity(lower(unaccent(coalesce(m2.text,''))), lower(unaccent($1))) * 0.45
+               + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
                AS ft_score,
              md5(m2.norm) AS norm_hash
       FROM m2
@@ -346,11 +344,11 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
           to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
              || websearch_to_tsquery('english', $1))
           OR
-          similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.20
+          similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
           OR
           EXISTS (
             SELECT 1 FROM unnest($3::text[]) AS t
-            WHERE lower(unaccent(coalesce(m.text,''))) ILIKE ('%'||t||'%')
+            WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
           )
         )
     ),
@@ -386,7 +384,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
             "score": score
         })
 
-    # лёгкая пост-фильтрация (по последним сообщениям канала)
     if only_promo or no_spam:
         filtered = []
         for ch in out:
@@ -431,7 +428,7 @@ async def search_messages(
     limit: int = 20,
     offset: int = 0,
     max_per_channel: int = 3,
-    live: bool = True,                # <- живой поиск включён по умолчанию
+    live: bool = True,
 ):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
@@ -440,11 +437,9 @@ async def search_messages(
     pool = await db()
     async with pool.acquire() as conn:
         if live:
-            # 1) live: находим каналы и быстро подкачиваем сообщения по ним
             try:
                 async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
                     chans = await live_find_channels(cli, q, limit=80)
-                    # если совсем пусто — попробуем расширить за счёт брендов/синонимов
                     if not chans:
                         widened = list(dict.fromkeys([q] + [q2] + BRAND_SEEDS))
                         random.shuffle(widened)
@@ -453,13 +448,11 @@ async def search_messages(
                             chans += cs
                             if len(chans) >= 80:
                                 break
-                    # подкачка последних сообщений
                     if chans:
                         await live_backfill_messages(cli, conn, chans[:80], days=days, per_channel=220)
             except Exception as e:
                 logging.warning(f"Live phase failed: {e}")
 
-        # 2) после live — делаем быстрый/глубокий поиск по локальной БД
         return JSONResponse(await db_search_messages(
             conn, q2, chat, only_public, since, toks, only_promo, no_spam,
             limit, offset, max_per_channel
@@ -473,7 +466,7 @@ async def search_chats(
     only_public: bool = True,
     no_spam: bool = True,
     limit: int = 15,
-    live: bool = True,                # <- живой поиск включён по умолчанию
+    live: bool = True,
 ):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
@@ -486,10 +479,8 @@ async def search_chats(
             try:
                 async with TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) as cli:
                     chans = await live_find_channels(cli, q, limit=100)
-                    # сохраним метаданные каналов сразу (и частично подкачаем сообщения)
                     if chans:
                         await live_backfill_messages(cli, conn, chans[:100], days=days, per_channel=200)
-                        # базовый "сырый" вывод каналов (на случай, если по БД ещё мало)
                         for ch in chans:
                             ch_url, _ = make_links(getattr(ch,"username",None), None)
                             live_list.append({
@@ -505,7 +496,6 @@ async def search_chats(
                 logging.warning(f"Live channels failed: {e}")
 
         res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit)
-        # Если после DB результатов мало, подстрахуемся живым списком (без дублей, сверху — DB)
         if res["total"] < limit and live_list:
             have = set((it["chat_username"], it["title"]) for it in res["items"])
             for it in live_list:
