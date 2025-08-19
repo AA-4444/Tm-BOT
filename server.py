@@ -16,10 +16,10 @@ from telethon.tl.types import Channel
 
 logging.basicConfig(level=logging.INFO)
 
-API_ID  = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
-PG_DSN = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+API_ID  = int(os.getenv("API_ID","0"))
+API_HASH = os.getenv("API_HASH","")
+STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION","")
+PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
@@ -47,10 +47,15 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
+-- FTS / сортировка по свежести
 CREATE INDEX IF NOT EXISTS ix_msg_tsv ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
 CREATE INDEX IF NOT EXISTS ix_chan_name ON channels USING GIN (to_tsvector('russian', coalesce(title,'')));
+
+-- триграммы по нормализованному тексту (ускорит similarity/ILIKE)
+CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
+USING GIN ( (lower(unaccent(coalesce(text,'')))) gin_trgm_ops );
 """
 
 async def db():
@@ -120,9 +125,30 @@ async def upsert_message(conn, row):
          row["links"], row["views"], row["forwards"])
 
 async def discover(client, query: str, limit_chats=200):
-    # больше каналов за проход
     res = await client(SearchRequest(q=query, limit=limit_chats))
     return [c for c in res.chats if isinstance(c, Channel) and getattr(c, 'username', None)]
+
+async def crawl_known(conn, cli, limit_channels=300, limit_msgs=300):
+    # случайная выборка уже известных каналов — подтягиваем свежие посты
+    rows = await conn.fetch("SELECT chat_id FROM channels ORDER BY random() LIMIT $1", limit_channels)
+    for r in rows:
+        try:
+            entity = await cli.get_entity(int(r["chat_id"]))
+        except Exception:
+            continue
+        async for msg in cli.iter_messages(entity, limit=limit_msgs):
+            text = msg.message or ""
+            row = {
+                "chat_id": entity.id,
+                "message_id": msg.id,
+                "date": (msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)),
+                "text": text,
+                "has_media": bool(msg.media),
+                "links": len(re.findall(r"https?://", text)),
+                "views": getattr(msg, "views", 0) or 0,
+                "forwards": getattr(msg, "forwards", 0) or 0,
+            }
+            await upsert_message(conn, row)
 
 async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
     pool = await db()
@@ -165,12 +191,18 @@ async def crawl_once(seeds: list[str], limit_msgs: int = 1000):
                         }
                         await upsert_message(conn, row)
 
+            # дополнительный проход по известным каналам (свежак)
+            try:
+                await crawl_known(conn, cli, limit_channels=300, limit_msgs=300)
+            except FloodWaitError as e:
+                logging.warning(f"FloodWait (known) {e.seconds}s")
+                await asyncio.sleep(e.seconds + 5)
+
 async def crawler_loop():
     seeds = [
         "casino", "казино", "free spins", "фриспины", "бесплатные вращения",
         "бездепозитный бонус", "промокод казино", "бонус казино",
-        "слоты", "slots",
-        "рулетка", "blackjack", "покер",
+        "слоты", "slots", "рулетка", "blackjack", "покер",
         "affiliate marketing", "affiliate casino", "cpa gambling", "арбитраж трафика", "партнерка казино"
     ]
     while True:
@@ -190,19 +222,25 @@ def make_links(username: Optional[str], message_id: Optional[int]):
     msg = f"{ch}/{message_id}" if message_id else None
     return ch, msg
 
+def tokens_for_like(q: str) -> list[str]:
+    # важные токены (>=3) для ILIKE-подпорки
+    toks = re.findall(r"\w+", q.lower())
+    return [t for t in toks if len(t) >= 3][:8]  # ограничим до 8 слов
+
 @app.get("/search_messages")
 async def search_messages(
     q: str = Query(..., min_length=2),
-    chat: Optional[str] = None,        # username канала (без @)
-    days: int = 90,                    # свежак
-    only_promo: bool = True,           # промо-фильтр
-    only_public: bool = True,          # только публичные (с username), чтобы давать ссылки
-    no_spam: bool = True,              # убирать мусор (стримы/расписания/фильмы/чистый спорт)
+    chat: Optional[str] = None,
+    days: int = 90,
+    only_promo: bool = True,
+    only_public: bool = True,
+    no_spam: bool = True,
     limit: int = 20,
     offset: int = 0,
 ):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    toks = tokens_for_like(q2)
 
     pool = await db()
     async with pool.acquire() as conn:
@@ -224,6 +262,11 @@ async def search_messages(
                  || websearch_to_tsquery('english', $1))
               OR
               similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.25
+              OR
+              EXISTS (
+                SELECT 1 FROM unnest($5::text[]) AS t
+                WHERE lower(unaccent(coalesce(m.text,''))) ILIKE ('%'||t||'%')
+              )
             )
         ),
         scored AS (
@@ -238,8 +281,8 @@ async def search_messages(
                chat_id, username, title, message_id, date, text, ft_score
         FROM scored
         ORDER BY chat_id, norm_hash, date DESC
-        LIMIT 700
-        """, q2, since, chat, only_public)
+        LIMIT 900
+        """, q2, since, chat, only_public, toks)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -250,7 +293,7 @@ async def search_messages(
         if only_promo and not is_promotional(txt):
             continue
         w = recency_weight(r["date"], now)
-        score = float(r["ft_score"] or 0.0) * 0.7 + w * 0.3
+        score = float(r["ft_score"] or 0.0) * 0.65 + w * 0.35
         ch_url, msg_url = make_links(r["username"], r["message_id"])
         items.append({
             "chat": r["username"] or r["title"],
@@ -279,6 +322,7 @@ async def search_chats(
 ):
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    toks = tokens_for_like(q2)
 
     pool = await db()
     async with pool.acquire() as conn:
@@ -295,6 +339,11 @@ async def search_chats(
                  || websearch_to_tsquery('english', $1))
               OR
               similarity(lower(unaccent(coalesce(m.text,''))), lower(unaccent($1))) >= 0.25
+              OR
+              EXISTS (
+                SELECT 1 FROM unnest($3::text[]) AS t
+                WHERE lower(unaccent(coalesce(m.text,''))) ILIKE ('%'||t||'%')
+              )
             )
         ),
         agg AS (
@@ -307,10 +356,10 @@ async def search_chats(
         )
         SELECT *
         FROM agg
-        WHERE ($3::bool IS FALSE OR username IS NOT NULL)
+        WHERE ($4::bool IS FALSE OR username IS NOT NULL)
         ORDER BY last_post DESC
-        LIMIT 400
-        """, q2, since, only_public)
+        LIMIT 500
+        """, q2, since, toks, only_public)
 
     now = datetime.now(timezone.utc)
     out = []
@@ -326,6 +375,7 @@ async def search_chats(
             "score": float(r["hits"]) * 0.6 + recency_weight(r["last_post"], now) * 0.4
         })
 
+    # лёгкая промо/анти-спам фильтрация
     if only_promo or no_spam:
         filtered = []
         async with pool.acquire() as conn2:
