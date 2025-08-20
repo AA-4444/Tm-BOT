@@ -1,5 +1,4 @@
-# server.py
-# deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
+
 
 import os, asyncio, re, math, logging, random, time, hashlib
 from datetime import timezone, datetime, timedelta
@@ -11,7 +10,7 @@ import asyncpg
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, UsernameNotOccupiedError, UsernameInvalidError
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Message, MessageService
 
@@ -20,7 +19,6 @@ logging.basicConfig(level=logging.INFO)
 # ============================== ENV ==============================
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
-# один или много StringSession: TELEGRAM_STRING_SESSIONS="sess1,sess2,..." (пробелы можно)
 SESS_LIST = [s.strip() for s in os.getenv("TELEGRAM_STRING_SESSIONS","").split(",") if s.strip()]
 if not SESS_LIST and os.getenv("TELEGRAM_STRING_SESSION",""):
     SESS_LIST = [os.getenv("TELEGRAM_STRING_SESSION").strip()]
@@ -33,13 +31,13 @@ LIVE_PER_CHANNEL_LIMIT = int(os.getenv("LIVE_PER_CHANNEL_LIMIT", "220"))
 LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 CRAWL_QUEUE_BATCH = int(os.getenv("CRAWL_QUEUE_BATCH", "120"))
 MAX_PARALLEL_CHANNELS = int(os.getenv("MAX_PARALLEL_CHANNELS", "6"))
-CRAWLER_SLEEP_SECONDS = int(os.getenv("CRAWLER_SLEEP_SECONDS", "120"))  # <— Пауза между циклами
+CRAWLER_SLEEP_SECONDS = int(os.getenv("CRAWLER_SLEEP_SECONDS", "120"))
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
 
-# глобальный «предохранитель» после FloodWait
-_flood_block_until: float = 0.0  # unix ts
+# глобальный предохранитель после FloodWait
+_flood_block_until: float = 0.0
 
 # ============================== DB DDL ==============================
 DDL = """
@@ -65,7 +63,6 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
--- кто/что уже показывали (анти-повторы)
 CREATE TABLE IF NOT EXISTS served_hits(
   user_key TEXT,
   qhash TEXT,
@@ -75,14 +72,12 @@ CREATE TABLE IF NOT EXISTS served_hits(
   PRIMARY KEY(user_key, qhash, chat_id, message_id)
 );
 
--- очередь на краул новых юзернеймов/каналов
 CREATE TABLE IF NOT EXISTS crawl_queue(
   username TEXT PRIMARY KEY,
   last_try TIMESTAMPTZ,
   tries INT DEFAULT 0
 );
 
--- FTS (ru+en) и свежесть
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_ru ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 
@@ -91,7 +86,6 @@ USING GIN (to_tsvector('english', coalesce(text,'')));
 
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
 
--- триграммы (без unaccent в выражении, т.к. not immutable)
 CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
 USING GIN ((lower(coalesce(text,''))) gin_trgm_ops);
 
@@ -99,7 +93,6 @@ CREATE INDEX IF NOT EXISTS ix_chan_name_ru ON channels
 USING GIN (to_tsvector('russian', coalesce(title,'')));
 """
 
-# ============================== DB pool ==============================
 async def db():
     global _db_pool
     if _db_pool is None:
@@ -107,6 +100,160 @@ async def db():
         async with _db_pool.acquire() as c:
             await c.execute(DDL)
     return _db_pool
+
+# ============================== Helpers ==============================
+TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,})\b|https?://t\.me/([a-zA-Z0-9_]{4,})\b")
+
+def _flood_blocked() -> bool:
+    return time.time() < _flood_block_until
+
+def _set_flood_block(seconds: int):
+    global _flood_block_until
+    _flood_block_until = time.time() + max(5, seconds)
+
+def _is_valid_uname(u: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_]{4,32}", u or ""))
+
+async def push_usernames_to_queue(conn, usernames: List[str]):
+    if not usernames:
+        return
+    usernames = [u.lower() for u in usernames if _is_valid_uname(u)]
+    if not usernames:
+        return
+    vals = [(u,) for u in set(usernames)]
+    await conn.executemany("""
+        INSERT INTO crawl_queue(username, last_try, tries) VALUES($1, NULL, 0)
+        ON CONFLICT (username) DO NOTHING
+    """, vals)
+
+def extract_usernames_from_text(txt: str) -> List[str]:
+    found = []
+    for m in TG_USERNAME_RE.finditer(txt or ""):
+        u = (m.group(1) or m.group(2) or "").lower()
+        if u and _is_valid_uname(u):
+            found.append(u)
+    return list(dict.fromkeys(found))
+
+async def drop_bad_usernames(conn, usernames: List[str]):
+    if not usernames:
+        return
+    await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in set(usernames)])
+
+# ============================== Session Pool ==============================
+class SessionPool:
+    def __init__(self, sessions: List[str]):
+        self.sessions = [s for s in sessions if s]
+        self.idx = 0
+        if not self.sessions:
+            raise RuntimeError("No TELEGRAM sessions provided")
+
+    def next_session(self) -> StringSession:
+        s = self.sessions[self.idx % len(self.sessions)]
+        self.idx += 1
+        return StringSession(s)
+
+    async def client(self) -> TelegramClient:
+        return TelegramClient(self.next_session(), API_ID, API_HASH)
+
+SESS_POOL = SessionPool(SESS_LIST)
+
+
+
+# ============================== Live ops ==============================
+async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Channel], days: int, per_channel: int = 250):
+    since_dt = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    sem = asyncio.Semaphore(MAX_PARALLEL_CHANNELS)
+    new_channels = 0
+    new_messages = 0
+
+    async def _one(ch: Channel):
+        nonlocal new_channels, new_messages
+        async with sem:
+            try:
+                ent = await cli.get_entity(ch)
+            except RPCError:
+                return
+            created = await upsert_channel(
+                conn,
+                ent.id,
+                getattr(ent, "username", None),
+                getattr(ent, "title", None),
+                "channel" if getattr(ent, "broadcast", False) else "supergroup",
+            )
+            if created:
+                new_channels += 1
+
+            async for msg in cli.iter_messages(ent, limit=per_channel):
+                dt = msg.date if msg.date else datetime.now(timezone.utc)
+                row = {
+                    "chat_id": ent.id,
+                    "message_id": msg.id,
+                    "date": dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc),
+                    "text": msg.message or "" if not isinstance(msg, MessageService) else "",
+                    "has_media": bool(getattr(msg, "media", None)),
+                    "links": len(re.findall(r"https?://", msg.message or "")),
+                    "views": getattr(msg, "views", 0) or 0,
+                    "forwards": getattr(msg, "forwards", 0) or 0,
+                }
+                if await upsert_message(conn, row):
+                    new_messages += 1
+                if row["text"]:
+                    us = extract_usernames_from_text(row["text"])
+                    if us:
+                        await push_usernames_to_queue(conn, us)
+
+    await asyncio.gather(*[_one(ch) for ch in channels], return_exceptions=True)
+    return new_channels, new_messages
+
+# ============================== Crawl Queue ==============================
+async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATCH):
+    if _flood_blocked():
+        return (0, 0, 0)
+    pool = await db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT username FROM crawl_queue
+            ORDER BY COALESCE(last_try, to_timestamp(0)) ASC
+            LIMIT $1
+        """, batch)
+        if not rows:
+            return (0, 0, 0)
+        usernames = [r["username"] for r in rows]
+        await conn.executemany("UPDATE crawl_queue SET last_try=NOW(), tries=COALESCE(tries,0)+1 WHERE username=$1",
+                               [(u,) for u in usernames])
+        bad = []
+        chans: List[Channel] = []
+        try:
+            async with (await SESS_POOL.client()) as cli:
+                for uname in usernames:
+                    if not _is_valid_uname(uname):
+                        bad.append(uname)
+                        continue
+                    try:
+                        ent = await cli.get_entity(uname)
+                        if isinstance(ent, Channel) and getattr(ent, "username", None):
+                            chans.append(ent)
+                        else:
+                            bad.append(uname)
+                    except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
+                        bad.append(uname)
+                    except FloodWaitError as e:
+                        _set_flood_block(e.seconds)
+                        break
+                    except RPCError as e:
+                        logging.info(f"Queue skip {uname} due to {e!r}")
+                ch_new = msg_new = 0
+                if chans:
+                    ch_new, msg_new = await live_backfill_messages(cli, conn, chans, days=365, per_channel=per_channel)
+                if bad:
+                    await drop_bad_usernames(conn, bad)
+                logging.info(f"Crawler: queue processed={len(usernames)}, new_channels={ch_new}, new_messages={msg_new}, bad={len(bad)}")
+                return (ch_new, msg_new, len(usernames))
+        except FloodWaitError as e:
+            _set_flood_block(e.seconds)
+            return (0, 0, 0)
+
+
 
 # ============================== TOPIC SEEDS ==============================
 # Расширенные сиды по казино/игорке/аффилиатам
@@ -152,7 +299,7 @@ SEEDS_ALL = list(dict.fromkeys(CASINO_BRANDS + AFF_NETWORKS + CASINO_RU + CASINO
 SYNONYMS = {
     r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
     r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
-    r"\bбонус(ы|ов)?\б": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
+    r"\bбонус(ы|ов)?b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
     r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
     r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
     r"\baffiliate\b": ["aff", "арбитраж", "партнерка", "партнёрка", "revshare", "hybrid", "cpa", "cpa gambling", "affiliate marketing"],
@@ -168,7 +315,7 @@ SPAM_NEG = re.compile(
     r"прогноз(ы)?\s*на\s*матч|ставк(и|а)\s*на\s*спорт|коэфф(ициент)?|odds|parlay)",
     re.I
 )
-TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,})\b|https?://t\.me/([a-zA-Z0-9_]{4,})\b")
+
 
 def expand_query(q: str) -> str:
     ql = q.lower()
@@ -252,12 +399,7 @@ def make_links(username: Optional[str], message_id: Optional[int]):
 def channels_only(chats: Iterable) -> list[Channel]:
     return [c for c in chats if isinstance(c, Channel) and getattr(c,"username",None)]
 
-def _flood_blocked() -> bool:
-    return time.time() < _flood_block_until
 
-def _set_flood_block(seconds: int):
-    global _flood_block_until
-    _flood_block_until = time.time() + max(5, seconds)
 
 async def push_usernames_to_queue(conn, usernames: List[str]):
     if not usernames: return
@@ -342,102 +484,9 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
         return []
     return channels_only(res.chats)
 
-async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Channel], days: int, per_channel: int = 250) -> Tuple[int,int]:
-    """
-    Возвращает (new_channels, new_messages) по итогам раунд-трипа.
-    """
-    since_dt = datetime.now(timezone.utc) - timedelta(days=max(1, days))
-    sem = asyncio.Semaphore(MAX_PARALLEL_CHANNELS)
-    new_channels = 0
-    new_messages = 0
-
-    async def _one(ch: Channel):
-        nonlocal new_channels, new_messages
-        async with sem:
-            try:
-                ent = await cli.get_entity(ch)
-            except RPCError:
-                return
-            created = await upsert_channel(
-                conn,
-                ent.id,
-                getattr(ent, "username", None),
-                getattr(ent, "title", None),
-                "channel" if getattr(ent, "broadcast", False) else "supergroup",
-            )
-            if created:
-                new_channels += 1
-
-            async for msg in cli.iter_messages(ent, limit=per_channel):
-                dt = (msg.date if msg.date and msg.date.tzinfo else (msg.date.replace(tzinfo=timezone.utc) if msg.date else None))
-                if dt and dt < since_dt:
-                    break
-                text = (getattr(msg, "message", None) or "") if not isinstance(msg, MessageService) else ""
-                row = {
-                    "chat_id": ent.id,
-                    "message_id": msg.id,
-                    "date": dt or datetime.now(timezone.utc),
-                    "text": text,
-                    "has_media": bool(getattr(msg, "media", None)),
-                    "links": len(re.findall(r"https?://", text)),
-                    "views": getattr(msg, "views", 0) or 0,
-                    "forwards": getattr(msg, "forwards", 0) or 0,
-                }
-                inserted = await upsert_message(conn, row)
-                if inserted:
-                    new_messages += 1
-
-                # извлечём новые username из текста и добавим в очередь
-                if text:
-                    us = extract_usernames_from_text(text)
-                    if us:
-                        await push_usernames_to_queue(conn, us)
-
-    tasks = [_one(ch) for ch in channels]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    return new_channels, new_messages
 
 # ============================== Crawler / Queue ==============================
-async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATCH) -> Tuple[int,int,int]:
-    """
-    Обрабатывает usernames из таблицы очереди. Возвращает (new_channels, new_messages, processed_usernames)
-    """
-    if _flood_blocked():
-        return (0, 0, 0)
-    pool = await db()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT username FROM crawl_queue
-            ORDER BY COALESCE(last_try, to_timestamp(0)) ASC
-            LIMIT $1
-        """, batch)
-        if not rows:
-            return (0, 0, 0)
-        usernames = [r["username"] for r in rows]
-        await conn.executemany(
-            "UPDATE crawl_queue SET last_try=NOW(), tries=COALESCE(tries,0)+1 WHERE username=$1",
-            [(u,) for u in usernames]
-        )
-        try:
-            async with (await SESS_POOL.client()) as cli:
-                chans: List[Channel] = []
-                for uname in usernames:
-                    try:
-                        ent = await cli.get_entity(uname)
-                        if isinstance(ent, Channel) and getattr(ent,"username",None):
-                            chans.append(ent)
-                    except RPCError:
-                        continue
-                if chans:
-                    ch_new, msg_new = await live_backfill_messages(cli, conn, chans, days=365, per_channel=per_channel)
-                    return (ch_new, msg_new, len(usernames))
-                else:
-                    return (0, 0, len(usernames))
-        except FloodWaitError as e:
-            _set_flood_block(e.seconds)
-            return (0, 0, 0)
+
 
 async def crawl_once(seeds: list[str], per_channel: int = 500) -> Tuple[int,int,int]:
     """
