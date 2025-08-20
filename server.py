@@ -12,6 +12,9 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, UsernameNotOccupiedError, UsernameInvalidError
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Message, MessageService
+import aiohttp
+from aiohttp import ClientTimeout
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
 
@@ -72,6 +75,12 @@ LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 CRAWL_QUEUE_BATCH = int(os.getenv("CRAWL_QUEUE_BATCH", "120"))
 MAX_PARALLEL_CHANNELS = int(os.getenv("MAX_PARALLEL_CHANNELS", "6"))
 CRAWLER_SLEEP_SECONDS = int(os.getenv("CRAWLER_SLEEP_SECONDS", "120"))
+AUTO_SEED_ENABLED = os.getenv("AUTO_SEED_ENABLED", "0").lower() in ("1", "true", "yes")
+AUTO_SEED_SOURCES = os.getenv("AUTO_SEED_SOURCES", "https://tgstat.com/ru/top-channels,https://tgstat.com/ru/categories/news,https://tgstat.com/ru/categories/technology,https://tgstat.com/ru/categories/entertainment,https://tgstat.com/ru/categories/business")  # список URL 
+AUTO_SEED_INTERVAL_SEC = int(os.getenv("AUTO_SEED_INTERVAL_SEC", "21600"))  
+AUTO_SEED_PER_URL_DELAY = float(os.getenv("AUTO_SEED_PER_URL_DELAY", "0.7"))  
+AUTO_SEED_FETCH_TIMEOUT = int(os.getenv("AUTO_SEED_FETCH_TIMEOUT", "20"))  
+AUTO_SEED_MAX_BYTES = int(os.getenv("AUTO_SEED_MAX_BYTES", "5242880"))  
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
@@ -707,7 +716,8 @@ async def crawler_loop():
         except Exception as e:
             logging.error(f"Crawler error: {e}")
 
-        await asyncio.sleep(max(10, CRAWLER_SLEEP_SECONDS))  # <= пауза между циклами
+        await asyncio.sleep(max(10, CRAWLER_SLEEP_SECONDS)) 
+        
 
 # ============================== Common search helpers ==============================
 def _diversify(items: list[dict], max_per_channel: int = 2) -> list[dict]:
