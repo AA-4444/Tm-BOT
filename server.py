@@ -1,5 +1,3 @@
-
-
 import os, asyncio, re, math, logging, random, time, hashlib
 from datetime import timezone, datetime, timedelta
 from typing import Optional, Iterable, List, Tuple
@@ -7,6 +5,7 @@ from typing import Optional, Iterable, List, Tuple
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import asyncpg
+import json
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -19,9 +18,48 @@ logging.basicConfig(level=logging.INFO)
 # ============================== ENV ==============================
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
-SESS_LIST = [s.strip() for s in os.getenv("TELEGRAM_STRING_SESSIONS","").split(",") if s.strip()]
-if not SESS_LIST and os.getenv("TELEGRAM_STRING_SESSION",""):
-    SESS_LIST = [os.getenv("TELEGRAM_STRING_SESSION").strip()]
+
+
+
+def load_sessions_from_env() -> list[str]:
+    sessions: list[str] = []
+
+    # JSON-массив (опционально): TELEGRAM_STRING_SESSIONS_JSON='["sess1","sess2"]'
+    raw_json = os.getenv("TELEGRAM_STRING_SESSIONS_JSON", "")
+    if raw_json.strip():
+        try:
+            arr = json.loads(raw_json)
+            if isinstance(arr, list):
+                sessions += [str(s).strip() for s in arr if str(s).strip()]
+        except Exception as e:
+            logging.warning(f"Bad TELEGRAM_STRING_SESSIONS_JSON: {e}")
+
+    # Одна строка с разделителями , ; | или перенос строки
+    raw = os.getenv("TELEGRAM_STRING_SESSIONS", "")
+    if raw.strip():
+        for part in re.split(r"[\n,;|]+", raw):
+            part = part.strip()
+            if part:
+                sessions.append(part)
+
+    # Несколько переменных: TELEGRAM_SESSION_1, TELEGRAM_SESSION_2, ...
+    for k, v in os.environ.items():
+        if k.startswith("TELEGRAM_SESSION_") or k.startswith("TG_SESSION_"):
+            v = (v or "").strip()
+            if v:
+                sessions.append(v)
+
+    # Одиночная переменная на всякий случай
+    single = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+    if single:
+        sessions.append(single)
+
+    # dedupe, preserve order
+    return list(dict.fromkeys([s for s in sessions if s]))
+
+SESS_LIST = load_sessions_from_env()
+if not SESS_LIST:
+    raise RuntimeError("No TELEGRAM sessions provided (check TELEGRAM_* env vars)")
 
 PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
 
