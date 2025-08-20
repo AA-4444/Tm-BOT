@@ -217,30 +217,66 @@ class SessionPool:
 
 SESS_POOL = SessionPool(SESS_LIST)
 
+# ============================== Crawler / Queue helpers ==============================
+_BACKOFF_BY_SESSION: dict[int, float] = {}
+_MIN_ROTATION_DELAY = float(os.getenv("MIN_ROTATION_DELAY", "0.3"))   # базовая пауза между попытками
+_JITTER_MAX = float(os.getenv("ROTATION_JITTER_MAX", "0.4"))          # случайный джиттер
+_PER_SESSION_COOLDOWN = float(os.getenv("PER_SESSION_COOLDOWN", "8")) # локальный кулдаун для сессии при Flood
+
 async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
-    """Пробует зарезолвить uname, перебирая сессии по кругу."""
+    """
+    Аккуратно резолвит uname, перебирая сессии по кругу, с микро-паузами и
+    локальным (per-session) backoff, чтобы резко не выбиваться в FloodWait.
+    Если все сессии словили Flood — кидает наш AllSessionsFlooded(seconds).
+    """
     max_tries = tries or len(SESS_LIST)
     last_wait: Optional[int] = None
+    used_sessions: list[int] = []
 
     for i in range(max_tries):
+        # какая именно по счёту сессия (индекс) сейчас будет
+        sess_idx = SESS_POOL.idx % len(SESS_LIST)
+        used_sessions.append(sess_idx)
+
+        # per-session локальный кулдаун
+        now = time.time()
+        next_ok = _BACKOFF_BY_SESSION.get(sess_idx, 0.0)
+        if now < next_ok:
+            # чуть спим, чтобы не долбить именно эту сессию
+            await asyncio.sleep(min(1.5, next_ok - now))
+
         cli = await SESS_POOL.client()
         try:
+            # небольшой “человеческий” интервал + джиттер
+            await asyncio.sleep(_MIN_ROTATION_DELAY + random.random() * _JITTER_MAX)
+
             async with cli:
-                return await cli.get_entity(uname)
+                ent = await cli.get_entity(uname)
+                return ent
+
         except FloodWaitError as e:
-            last_wait = getattr(e, "seconds", None)
-            if last_wait:
-                _set_flood_block(last_wait)
+            # глобальный предохранитель (для всего процесса)
+            sec = int(getattr(e, "seconds", 30) or 30)
+            last_wait = sec
+            _set_flood_block(sec)
+
+            # локальный предохранитель (только для этой сессии)
+            _BACKOFF_BY_SESSION[sess_idx] = time.time() + max(_PER_SESSION_COOLDOWN, min(sec, 180))
+
             logging.warning(
-                f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; "
-                f"block={last_wait if last_wait is not None else 'unknown'}s"
+                f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; block={sec}s; session={sess_idx+1}"
             )
             continue
+
+        except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
+            # имя не занято / некорректное — отдаём наверх, чтобы вызвать drop из очереди
+            raise e
+
         except RPCError as e:
             logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
             continue
 
-    # Все сессии перепробованы — сигналим наружу своим исключением
+    # если сюда пришли — перебрали все попытки, но не удалось
     raise AllSessionsFlooded(last_wait)
 
 # ============================== Live ops ==============================
@@ -312,14 +348,12 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
         if not rows:
             return (0, 0, 0)
 
-        # получаем порцию из очереди...
         usernames = [r["username"] for r in rows]
         await conn.executemany(
             "UPDATE crawl_queue SET last_try=NOW(), tries=COALESCE(tries,0)+1 WHERE username=$1",
             [(u,) for u in usernames]
         )
 
-        # выкидываем те, что уже есть в channels (из очереди удаляем)
         known = await conn.fetch("""
             SELECT lower(username) AS u
             FROM channels
@@ -331,7 +365,6 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in known_set])
 
         try:
-            # все рабочие переменные — внутри try
             chans: List[Channel] = []
             bad: List[str] = []
             not_channel = 0
@@ -341,7 +374,6 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
                     bad.append(uname)
                     continue
                 try:
-                    # резолв через ротацию сессий
                     ent = await resolve_entity_with_rotation(uname)
                     if isinstance(ent, Channel) and getattr(ent, "username", None):
                         chans.append(ent)
@@ -350,35 +382,31 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
                         bad.append(uname)
 
                 except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-                    # имени нет / некорректно → убрать из очереди
                     bad.append(uname)
 
                 except AllSessionsFlooded as e:
-                    # все сессии словили FloodWait — прерываем батч
+                    # глобально стопаем батч — выставили предохранитель внутри resolve
                     logging.warning(
                         f"All sessions flooded while resolving @{uname}; block={e.seconds or flood_left()}s"
                     )
                     break
 
                 except FloodWaitError as e:
-                    # на всякий случай, если Telethon всё же кинет наружу
-                    _set_flood_block(getattr(e, "seconds", 30))
-                    logging.warning(
-                        f"Crawler: FloodWait on @{uname}, block={getattr(e,'seconds','unknown')}s"
-                    )
+                    # на всякий случай, если Telethon что-то выкинул напрямую
+                    sec = int(getattr(e, "seconds", 30) or 30)
+                    _set_flood_block(sec)
+                    logging.warning(f"Crawler: FloodWait on @{uname}, block={sec}s")
                     break
 
             ch_new = 0
             msg_new = 0
             if chans:
-                # для backfill достаточно одного клиента (любой сессии)
                 async with (await SESS_POOL.client()) as cli:
                     ch_new, msg_new = await live_backfill_messages(
                         cli, conn, chans, days=365, per_channel=per_channel
                     )
 
             if bad:
-                # удаляем «плохие» / не-канальные username из очереди
                 await drop_bad_usernames(conn, bad)
 
             logging.info(
@@ -388,10 +416,10 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             return (ch_new, msg_new, len(usernames))
 
         except FloodWaitError as e:
-            _set_flood_block(getattr(e, "seconds", 30))
-            logging.warning(f"Crawler: FloodWait outside loop, block={getattr(e,'seconds','unknown')}s")
-            return (0, 0, 0)  
-
+            sec = int(getattr(e, "seconds", 30) or 30)
+            _set_flood_block(sec)
+            logging.warning(f"Crawler: FloodWait outside loop, block={sec}s")
+            return (0, 0, 0)
 
 
 # ============================== TOPIC SEEDS ==============================
@@ -577,17 +605,37 @@ async def upsert_message(conn, row) -> bool:
 
 # ============================== Live operations ==============================
 async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
+  
     if _flood_blocked():
         return []
+
+    
     try:
+        await asyncio.sleep(0.15 + random.random() * 0.25)
         res = await cli(SearchRequest(q=query, limit=limit))
+        return channels_only(res.chats)
     except FloodWaitError as e:
-        logging.warning(f"FloodWait {e.seconds}s on SearchRequest")
-        _set_flood_block(e.seconds)
+        sec = int(getattr(e, "seconds", 30) or 30)
+        logging.warning(f"FloodWait {sec}s on SearchRequest (first try)")
+        _set_flood_block(sec)
+        return []
+    except RPCError:
+        pass
+
+    
+    try:
+        other = await SESS_POOL.client()
+        async with other:
+            await asyncio.sleep(0.2 + random.random() * 0.3)
+            res = await other(SearchRequest(q=query, limit=limit))
+            return channels_only(res.chats)
+    except FloodWaitError as e:
+        sec = int(getattr(e, "seconds", 30) or 30)
+        logging.warning(f"FloodWait {sec}s on SearchRequest (second try)")
+        _set_flood_block(sec)
         return []
     except RPCError:
         return []
-    return channels_only(res.chats)
 
 
 # ============================== Crawler / Queue ==============================
@@ -711,59 +759,60 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
     penalty = float(intent.get("penalty", 0.0))
 
     rows = await conn.fetch(r"""
-    WITH m2 AS (
-      SELECT m.chat_id, m.message_id, m.date, m.text,
-             m.views, m.forwards,
-             c.username, c.title,
-             lower(regexp_replace(coalesce(m.text,''), '\s+', ' ', 'g')) AS norm,
-             -- intent keywords
-             (cardinality($6::text[]) = 0 OR EXISTS (
-                SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-             )) AS kw_incl,
-             (cardinality($7::text[]) > 0 AND EXISTS (
-                SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-             )) AS kw_excl
-      FROM messages m
-      JOIN channels c USING(chat_id)
-      WHERE m.date >= $2
-        AND ($3::text IS NULL OR lower(c.username)=lower($3))
-        AND ($4::bool IS FALSE OR c.username IS NOT NULL)
-        AND (
-          to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
-             || websearch_to_tsquery('russian', $1))
-          OR
-          to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
-             || websearch_to_tsquery('english', $1))
-          OR
-          similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
-          OR
-          EXISTS (
-            SELECT 1 FROM unnest($5::text[]) AS t
-            WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
-          )
-        )
-        AND (NOT $8::bool OR ( (cardinality($6::text[]) = 0 OR EXISTS (
-                SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-            )) AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
-                SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-            ))  ))
-    ),
-    scored AS (
-      SELECT m2.*,
-             ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
-               + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
-               + (CASE WHEN m2.kw_incl THEN $9::float ELSE 0 END)
-               - (CASE WHEN m2.kw_excl THEN $10::float ELSE 0 END)
-               AS ft_score,
-             md5(m2.norm) AS norm_hash
-      FROM m2
-    )
-    SELECT DISTINCT ON (chat_id, norm_hash)
-           chat_id, username, title, message_id, date, text, views, forwards, ft_score
-    FROM scored
-    ORDER BY chat_id, norm_hash, date DESC
-    LIMIT 2000
-    """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty)
+        WITH m2 AS (
+         SELECT m.chat_id, m.message_id, m.date, m.text,
+         m.views, m.forwards,
+         c.username, c.title,
+         lower(regexp_replace(coalesce(m.text,''), '\s+', ' ', 'g')) AS norm,
+         (cardinality($6::text[]) = 0 OR EXISTS (
+            SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+         )) AS kw_incl,
+         (cardinality($7::text[]) > 0 AND EXISTS (
+            SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+         )) AS kw_excl
+        FROM messages m
+        JOIN channels c USING(chat_id)
+        WHERE m.date >= $2
+          AND ($3::text IS NULL OR lower(c.username)=lower($3))
+          AND ($4::bool IS FALSE OR c.username IS NOT NULL)
+          AND length(coalesce(m.text,'')) >= 5 -- убираем совсем пустые/мусорные
+         AND (
+         to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
+                || websearch_to_tsquery('russian', $1))
+             OR
+                to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
+                 || websearch_to_tsquery('english', $1))
+             OR
+           similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
+              OR
+             EXISTS (
+                 SELECT 1 FROM unnest($5::text[]) AS t
+                 WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
+                 )
+             )
+            AND (NOT $8::bool OR ( (cardinality($6::text[]) = 0 OR EXISTS (
+                   SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+              )) AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
+              SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+              ))  ))
+            ),
+        scored AS (
+        SELECT m2.*,
+              ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
+                   + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
+                   + (CASE WHEN m2.kw_incl THEN $9::float ELSE 0 END)
+                  - (CASE WHEN m2.kw_excl THEN $10::float ELSE 0 END)
+                 AS ft_score,
+                md5(m2.norm) AS norm_hash
+            FROM m2
+                )
+            SELECT DISTINCT ON (chat_id, norm_hash)
+            chat_id, username, title, message_id, date, text, views, forwards, ft_score
+        FROM scored
+        -- для одинаковых chat_id+norm оставляем более свежую и “интересную”
+        ORDER BY chat_id, norm_hash, date DESC, views DESC
+            LIMIT 2000
+        """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -980,6 +1029,39 @@ async def queue_add(usernames: str = Query(..., description="comma-separated @us
         await push_usernames_to_queue(conn, us)
     return {"ok": True, "queued": len(us)}
 
+@app.post("/queue/seed")
+async def queue_seed(body: dict):
+    """
+    Принимает JSON вида:
+    {
+      "usernames": ["ch1","@ch2","https://t.me/ch3", "..."]
+    }
+    Ставит в очередь валидные имена (в нижнем регистре), без дублей.
+    """
+    raw = body.get("usernames") or []
+    if not isinstance(raw, list):
+        return {"ok": False, "error": "field 'usernames' must be a list"}
+
+    cleaned: List[str] = []
+    for x in raw:
+        if not x:
+            continue
+        s = str(x).strip()
+        s = re.sub(r"^https?://t\.me/","", s, flags=re.I)
+        s = s.lstrip("@").strip()
+        if _is_valid_uname(s):
+            cleaned.append(s.lower())
+
+    cleaned = list(dict.fromkeys(cleaned))
+    if not cleaned:
+        return {"ok": False, "queued": 0}
+
+    pool = await db()
+    async with pool.acquire() as conn:
+        await push_usernames_to_queue(conn, cleaned)
+
+    return {"ok": True, "queued": len(cleaned)}
+
 @app.get("/search_messages")
 async def search_messages(
     q: str = Query(..., min_length=2),
@@ -1014,17 +1096,40 @@ async def search_messages(
                             chans += cs
                             if len(chans) >= LIVE_MAX_CHATS:
                                 break
+
                     if chans:
-                        await live_backfill_messages(cli, conn, chans[:LIVE_MAX_CHATS], days=days, per_channel=LIVE_PER_CHANNEL_LIMIT)
+                        chans = chans[:LIVE_MAX_CHATS]
+                        await asyncio.sleep(0.2 + random.random() * 0.4)
+                        await live_backfill_messages(
+                            cli,
+                            conn,
+                            chans,
+                            days=days,
+                            per_channel=min(LIVE_PER_CHANNEL_LIMIT, 160),
+                        )
+
             except FloodWaitError as e:
-                _set_flood_block(e.seconds)
+                _set_flood_block(getattr(e, "seconds", 30))
             except Exception as e:
                 logging.warning(f"Live phase failed: {e}")
 
-        return JSONResponse(await db_search_messages(
-            conn, q2, chat, only_public, since, toks, only_promo, no_spam,
-            limit, offset, max_per_channel, user_key=u, intent=intent
-        ))
+        return JSONResponse(
+            await db_search_messages(
+                conn,
+                q2,
+                chat,
+                only_public,
+                since,
+                toks,
+                only_promo,
+                no_spam,
+                limit,
+                offset,
+                max_per_channel,
+                user_key=u,
+                intent=intent,
+            )
+        )
 
 @app.get("/search_chats")
 async def search_chats(
@@ -1049,13 +1154,32 @@ async def search_chats(
                 async with (await SESS_POOL.client()) as cli:
                     chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 120))
                     if chans:
-                        await live_backfill_messages(cli, conn, chans[:LIVE_MAX_CHATS], days=days, per_channel=LIVE_KNOWN_PER_CHANNEL)
+                        chans = chans[:LIVE_MAX_CHATS]
+                        await asyncio.sleep(0.2 + random.random() * 0.4)
+                        await live_backfill_messages(
+                            cli,
+                            conn,
+                            chans,
+                            days=days,
+                            per_channel=min(LIVE_KNOWN_PER_CHANNEL, 160),
+                        )
             except FloodWaitError as e:
-                _set_flood_block(e.seconds)
+                _set_flood_block(getattr(e, "seconds", 30))
             except Exception as e:
                 logging.warning(f"Live channels failed: {e}")
 
-        res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit, user_key=u, intent=intent)
+        res = await db_search_chats(
+            conn,
+            q2,
+            only_public,
+            since,
+            toks,
+            only_promo,
+            no_spam,
+            limit,
+            user_key=u,
+            intent=intent,
+        )
         return JSONResponse(res)
 
 # ============================== ENTRYPOINT ==============================
