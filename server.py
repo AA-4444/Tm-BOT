@@ -61,6 +61,8 @@ SESS_LIST = load_sessions_from_env()
 if not SESS_LIST:
     raise RuntimeError("No TELEGRAM sessions provided (check TELEGRAM_* env vars)")
 
+logging.info(f"Loaded {len(SESS_LIST)} Telegram sessions")
+
 PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
 
 RUN_CRAWLER = os.getenv("RUN_CRAWLER","0").lower() in ("1","true","yes")
@@ -182,6 +184,7 @@ async def drop_bad_usernames(conn, usernames: List[str]):
     await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in set(usernames)])
 
 # ============================== Session Pool ==============================
+# ============================== Session Pool ==============================
 class SessionPool:
     def __init__(self, sessions: List[str]):
         self.sessions = [s for s in sessions if s]
@@ -192,10 +195,18 @@ class SessionPool:
     def next_session(self) -> StringSession:
         s = self.sessions[self.idx % len(self.sessions)]
         self.idx += 1
+        # просто для трейсинга какая сессия (номер)
+        logging.info(f"Using TG session #{(self.idx - 1) % len(self.sessions) + 1}")
         return StringSession(s)
 
     async def client(self) -> TelegramClient:
-        return TelegramClient(self.next_session(), API_ID, API_HASH)
+        # важно: отключаем авто-сон Telethon, пусть бросает FloodWaitError
+        return TelegramClient(
+            self.next_session(),
+            API_ID,
+            API_HASH,
+            flood_sleep_threshold=0
+        )
 
 SESS_POOL = SessionPool(SESS_LIST)
 
@@ -288,57 +299,53 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
         if known_set:
             await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in known_set])
 
-        bad: List[str] = []
-        not_channel = 0
-        chans: List[Channel] = []
-
         try:
-            async with (await SESS_POOL.client()) as cli:
-                for uname in to_resolve:
-                    # быстрая проверка валидности формата
-                    if not _is_valid_uname(uname):
-                        bad.append(uname)
-                        continue
-                    try:
-                        ent = await cli.get_entity(uname)
-                        if isinstance(ent, Channel) and getattr(ent, "username", None):
-                            chans.append(ent)
-                        else:
-                            # это не канал/супергруппа с @username → из очереди убираем
-                            not_channel += 1
-                            bad.append(uname)
-                    except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-                        # имени нет/некорректно → из очереди убрать
-                        bad.append(uname)
-                    except FloodWaitError as e:
-                        _set_flood_block(e.seconds)
-                        logging.warning(f"Crawler: FloodWait on get_entity @{uname}, block={e.seconds}s")
-                        break
-                    except RPCError as e:
-                        # временные ошибки телеграма просто логируем, элемент в очереди останется
-                        logging.info(f"Crawler: queue skip @{uname} due to {e!r}")
+            # ВСЕ внутренние переменные объявляем ВНУТРИ try, а не снаружи
+            chans: List[Channel] = []
+            bad: List[str] = []
+            not_channel = 0
 
-                ch_new = 0
-                msg_new = 0
-                if chans:
+            for uname in to_resolve:
+                if not _is_valid_uname(uname):
+                    bad.append(uname)
+                    continue
+                try:
+                    # резолвим с ротацией сессий
+                    ent = await resolve_entity_with_rotation(uname)
+                    if isinstance(ent, Channel) and getattr(ent, "username", None):
+                        chans.append(ent)
+                    else:
+                        not_channel += 1
+                        bad.append(uname)
+                except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+                    bad.append(uname)
+                except FloodWaitError:
+                    # глобальный блок уже выставлен — прерываем батч
+                    break
+
+            ch_new = 0
+            msg_new = 0
+            if chans:
+                # для backfill открываем один клиент (любая сессия)
+                async with (await SESS_POOL.client()) as cli:
                     ch_new, msg_new = await live_backfill_messages(
                         cli, conn, chans, days=365, per_channel=per_channel
                     )
 
-                if bad:
-                    # удаляем «плохие»/неактуальные/не-канальные username
-                    await drop_bad_usernames(conn, bad)
+            if bad:
+                # удаляем «плохие»/не-канальные username из очереди
+                await drop_bad_usernames(conn, bad)
 
-                logging.info(
-                    "Crawler: queue processed=%d, to_resolve=%d, known=%d, not_channel=%d, bad=%d, new_channels=%d, new_messages=%d",
-                    len(usernames), len(to_resolve), len(known_set), not_channel, len(bad), ch_new, msg_new
-                )
-                return (ch_new, msg_new, len(usernames))
+            logging.info(
+                "Crawler: queue processed=%d, to_resolve=%d, known=%d, not_channel=%d, bad=%d, new_channels=%d, new_messages=%d",
+                len(usernames), len(to_resolve), len(known_set), not_channel, len(bad), ch_new, msg_new
+            )
+            return (ch_new, msg_new, len(usernames))
 
         except FloodWaitError as e:
             _set_flood_block(e.seconds)
             logging.warning(f"Crawler: FloodWait outside loop, block={e.seconds}s")
-            return (0, 0, 0)
+            return (0, 0, 0)     
 
 
 
@@ -540,6 +547,25 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
 
 # ============================== Crawler / Queue ==============================
 
+async def resolve_entity_with_rotation(uname: str, tries: int = None):
+    """Пробует зарезолвить uname перебирая сессии по кругу."""
+    max_tries = tries or len(SESS_LIST)
+    for i in range(max_tries):
+        cli = await SESS_POOL.client()
+        try:
+            async with cli:
+                ent = await cli.get_entity(uname)
+                return ent
+        except FloodWaitError as e:
+            _set_flood_block(e.seconds)
+            logging.warning(f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; block={e.seconds}s")
+            continue  # пробуем следующую сессию
+        except RPCError as e:
+            logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
+            continue
+    # все сессии перепробованы — сдаёмся
+    # raise FloodWaitError(request=None, x=None, seconds=flood_left())
+    raise FloodWaitError(None, None, seconds=flood_left())
 
 async def crawl_once(seeds: list[str], per_channel: int = 500) -> Tuple[int,int,int]:
     """
