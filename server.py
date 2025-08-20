@@ -135,8 +135,8 @@ CASINO_EN = [
 ]
 
 START_USERNAMES = [
-    # можно заранее подбросить несколько известных пабликов (пример, оставить пустым если не надо)
-    # "ggbet", "parimatchru", "winline", ...
+    # примеры, можно заполнить своими
+    # "ggbet", "parimatchru", "winline",
 ]
 
 # Доп. широкие темы — помогают растянуть граф, но не используются в ранжировании казино
@@ -210,6 +210,36 @@ def normalize_query_for_hash(q: str) -> str:
 def qhash(q: str) -> str:
     return hashlib.md5(normalize_query_for_hash(q).encode("utf-8")).hexdigest()
 
+# ---------- Intent detection (affiliate / casino / jobs / generic) ----------
+AFFILIATE_INCLUDE = [
+    "affiliate","affiliates","aff","арбитраж","арбитраж трафика","партнерка","партнёрка",
+    "кэп", "кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
+    "media buying","buying","тимлид","сетка","сетка офферов","сеть офферов",
+    "traffic","трафик","nutra","gambling","беттинг","игорка","casino affiliate"
+]
+AFFILIATE_EXCLUDE = [
+    "free spins","фриспин","фриспины","промокод","бездеп","депозитный бонус","welcome bonus",
+    "ставки на спорт","фрибет"
+]
+
+JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","team lead","junior","middle","senior"]
+JOBS_EXCLUDE = []
+
+CASINO_PROMO_INCLUDE = ["free spins","фриспины","бонус","промокод","no deposit","бездеп","cashback","кэшбек","welcome"]
+CASINO_PROMO_EXCLUDE = ["ваканс","job","affiliate","арбитраж","партнерк"]
+
+def detect_intent(q: str):
+    ql = q.lower()
+    def anyw(words): return any(w in ql for w in words)
+    if anyw(["affiliate","арбитраж","партнерк","cpa","revshare","hybrid"]):
+        return dict(name="affiliate", include=AFFILIATE_INCLUDE, exclude=AFFILIATE_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
+    if anyw(["ваканс","vacancy","job","работа","hiring"]):
+        return dict(name="jobs", include=JOBS_INCLUDE, exclude=JOBS_EXCLUDE, strict=False, boost=0.25, penalty=0.0)
+    if anyw(["casino","казино","фриспин","free spins","бонус","промокод"]):
+        return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=False, boost=0.25, penalty=0.15)
+    # generic
+    return dict(name="generic", include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
+
 # ============================== Live helpers (Telegram) ==============================
 def make_links(username: Optional[str], message_id: Optional[int]):
     if not username:
@@ -235,6 +265,8 @@ async def push_usernames_to_queue(conn, usernames: List[str]):
         INSERT INTO crawl_queue(username, last_try, tries) VALUES($1, NULL, 0)
         ON CONFLICT (username) DO NOTHING
     """, vals)
+
+TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,})\b|https?://t\.me/([a-zA-Z0-9_]{4,})\b")
 
 def extract_usernames_from_text(txt: str) -> List[str]:
     found = []
@@ -333,16 +365,6 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
                     if us:
                         await push_usernames_to_queue(conn, us)
 
-                # форварды → очередь
-                try:
-                    if hasattr(msg, "fwd_from") and msg.fwd_from and getattr(msg.fwd_from, "from_name", None) is None:
-                        # если есть оригинальный channel_id + username
-                        if getattr(msg.fwd_from, "from_id", None) and hasattr(msg.fwd_from.from_id, "channel_id"):
-                            # username может и не быть, но часто будет в тексте
-                            pass
-                except Exception:
-                    pass
-
     tasks = [_one(ch) for ch in channels]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -361,7 +383,6 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
         if not rows:
             return
         usernames = [r["username"] for r in rows]
-        # отметим попытку
         await conn.executemany(
             "UPDATE crawl_queue SET last_try=NOW(), tries=COALESCE(tries,0)+1 WHERE username=$1",
             [(u,) for u in usernames]
@@ -403,14 +424,12 @@ async def crawler_loop():
     while True:
         try:
             logging.info("Crawler: cycle start")
-            # 1) очередь из найденных username (из сообщений/ручных пушей)
             await crawl_from_queue(per_channel=350, batch=CRAWL_QUEUE_BATCH)
-            # 2) плановый обход по сиду
             await crawl_once(seeds, per_channel=320)
             logging.info("Crawler: cycle end")
         except Exception as e:
             logging.error(f"Crawler error: {e}")
-        await asyncio.sleep(60*20)  # 20 минут пауза между циклами
+        await asyncio.sleep(60*20)
 
 # ============================== Common search helpers ==============================
 def _diversify(items: list[dict], max_per_channel: int = 2) -> list[dict]:
@@ -428,12 +447,10 @@ async def _apply_antirepeat_and_record(conn, user_key: Optional[str], q: str, it
     if not user_key:
         return len(items), items
     h = qhash(q)
-    # выкинем то, что уже показывали этому user_key для этого qhash
     filt = []
     for it in items:
-        cid = it.get("chat_id") or None  # может и не быть — добавим ниже
+        cid = it.get("chat_id") or None
         mid = it.get("message_id") or None
-        # если chat_id нет — мы его не сохраняли, оставим
         if cid and mid:
             seen = await conn.fetchval("""
                 SELECT 1 FROM served_hits WHERE user_key=$1 AND qhash=$2 AND chat_id=$3 AND message_id=$4
@@ -441,7 +458,6 @@ async def _apply_antirepeat_and_record(conn, user_key: Optional[str], q: str, it
             if seen:
                 continue
         filt.append(it)
-    # запишем, что отдали
     rows = [(user_key, h, it.get("chat_id"), it.get("message_id")) for it in filt if it.get("chat_id") and it.get("message_id")]
     if rows:
         await conn.executemany("""
@@ -450,18 +466,33 @@ async def _apply_antirepeat_and_record(conn, user_key: Optional[str], q: str, it
         """, rows)
     return len(items), filt
 
-# ============================== DB search ==============================
+# ============================== DB search (intent-aware) ==============================
 async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bool,
                              since: datetime, toks: list[str],
                              only_promo: bool, no_spam: bool,
                              limit: int, offset: int, max_per_channel: int,
-                             user_key: Optional[str] = None):
+                             user_key: Optional[str] = None,
+                             intent=None):
+    intent = intent or dict(include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
+    inc = intent.get("include", [])
+    exc = intent.get("exclude", [])
+    strict = bool(intent.get("strict", False))
+    boost = float(intent.get("boost", 0.0))
+    penalty = float(intent.get("penalty", 0.0))
+
     rows = await conn.fetch(r"""
     WITH m2 AS (
       SELECT m.chat_id, m.message_id, m.date, m.text,
              m.views, m.forwards,
              c.username, c.title,
-             lower(regexp_replace(coalesce(m.text,''), '\s+', ' ', 'g')) AS norm
+             lower(regexp_replace(coalesce(m.text,''), '\s+', ' ', 'g')) AS norm,
+             -- intent keywords
+             (cardinality($6::text[]) = 0 OR EXISTS (
+                SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             )) AS kw_incl,
+             (cardinality($7::text[]) > 0 AND EXISTS (
+                SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             )) AS kw_excl
       FROM messages m
       JOIN channels c USING(chat_id)
       WHERE m.date >= $2
@@ -481,11 +512,18 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
             WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
           )
         )
+        AND (NOT $8::bool OR ( (cardinality($6::text[]) = 0 OR EXISTS (
+                SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+            )) AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
+                SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+            )) ))
     ),
     scored AS (
       SELECT m2.*,
              ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
                + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
+               + (CASE WHEN m2.kw_incl THEN $9::float ELSE 0 END)
+               - (CASE WHEN m2.kw_excl THEN $10::float ELSE 0 END)
                AS ft_score,
              md5(m2.norm) AS norm_hash
       FROM m2
@@ -495,7 +533,7 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
     FROM scored
     ORDER BY chat_id, norm_hash, date DESC
     LIMIT 2000
-    """, q2, since, chat, only_public, toks)
+    """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -527,7 +565,6 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
 
     items.sort(key=lambda x: x["score"], reverse=True)
     items = _diversify(items, max_per_channel=max_per_channel)
-    # анти-повторы
     _, items = await _apply_antirepeat_and_record(conn, user_key, q2, items)
     total = len(items)
     items = items[offset:offset+limit]
@@ -535,11 +572,25 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
 
 async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, toks: list[str],
                           only_promo: bool, no_spam: bool, limit: int,
-                          user_key: Optional[str] = None):
-    # 1) По сообщениям
+                          user_key: Optional[str] = None,
+                          intent=None):
+    intent = intent or dict(include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
+    inc = intent.get("include", [])
+    exc = intent.get("exclude", [])
+    strict = bool(intent.get("strict", False))
+    boost = float(intent.get("boost", 0.0))
+    penalty = float(intent.get("penalty", 0.0))
+
+    # 1) По сообщениям (с intent-сигналами на уровне сообщений)
     rows_msg = await conn.fetch(r"""
     WITH cand AS (
-      SELECT m.chat_id, m.date, m.text, m.views, m.forwards
+      SELECT m.chat_id, m.date, m.text, m.views, m.forwards,
+             (cardinality($3::text[]) = 0 OR EXISTS (
+                SELECT 1 FROM unnest($3::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             )) AS kw_incl,
+             (cardinality($4::text[]) > 0 AND EXISTS (
+                SELECT 1 FROM unnest($4::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             )) AS kw_excl
       FROM messages m
       WHERE m.date >= $2
         AND (
@@ -552,7 +603,7 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
           similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
           OR
           EXISTS (
-            SELECT 1 FROM unnest($3::text[]) AS t
+            SELECT 1 FROM unnest($5::text[]) AS t
             WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
           )
         )
@@ -562,22 +613,26 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
              count(*) AS hits,
              max(cand.date) AS last_post,
              sum(cand.views) AS views_sum,
-             sum(cand.forwards) AS fw_sum
+             sum(cand.forwards) AS fw_sum,
+             sum(CASE WHEN cand.kw_incl THEN 1 ELSE 0 END) AS incl_hits,
+             sum(CASE WHEN cand.kw_excl THEN 1 ELSE 0 END) AS excl_hits
       FROM cand
       JOIN channels c ON c.chat_id=cand.chat_id
       GROUP BY c.chat_id, c.username, c.title
     )
     SELECT *
     FROM agg
-    WHERE ($4::bool IS FALSE OR username IS NOT NULL)
+    WHERE ($6::bool IS FALSE OR username IS NOT NULL)
+      AND (NOT $7::bool OR (incl_hits > 0 AND excl_hits = 0))
     ORDER BY last_post DESC
     LIMIT 1000
-    """, q2, since, toks, only_public)
+    """, q2, since, inc, exc, toks, only_public, strict)
 
     # 2) По названию/username
     rows_meta = await conn.fetch(r"""
     SELECT chat_id, username, title, NOW()::timestamptz AS last_post,
-           0::bigint AS hits, 0::bigint AS views_sum, 0::bigint AS fw_sum
+           0::bigint AS hits, 0::bigint AS views_sum, 0::bigint AS fw_sum,
+           0::bigint AS incl_hits, 0::bigint AS excl_hits
     FROM channels
     WHERE
       (to_tsvector('simple', coalesce(username,'') || ' ' || coalesce(title,'')) @@
@@ -590,32 +645,36 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     now = datetime.now(timezone.utc)
     out_map: dict[int, dict] = {}
 
-    def put_row(chat_id, username, title, last_post, hits, views_sum, fw_sum, meta_boost=False):
+    def put_row(row, meta_boost=False):
+        chat_id = int(row["chat_id"])
+        username, title = row["username"], row["title"]
         ch_url, _ = make_links(username, None)
         score = (
-            float(hits) * 0.45 +
-            recency_weight(last_post, now) * 0.35 +
-            log1p(views_sum) * 0.12 +
-            log1p(fw_sum) * 0.08 +
+            float(row["hits"]) * 0.45 +
+            recency_weight(row["last_post"], now) * 0.35 +
+            log1p(row["views_sum"]) * 0.12 +
+            log1p(row["fw_sum"]) * 0.08 +
+            (boost if (row.get("incl_hits",0) and not row.get("excl_hits",0)) else 0.0) -
+            (penalty if (row.get("excl_hits",0) > 0) else 0.0) +
             (0.3 if meta_boost else 0.0)
         )
-        out_map[int(chat_id)] = {
-            "chat_id": int(chat_id),
+        out_map[chat_id] = {
+            "chat_id": chat_id,
             "chat": username or title,
             "chat_username": username,
             "channel_url": ch_url,
             "title": title,
-            "last_post": last_post.isoformat() if last_post else None,
-            "hits": int(hits),
+            "last_post": row["last_post"].isoformat() if row["last_post"] else None,
+            "hits": int(row["hits"]),
             "score": float(score)
         }
 
     for r in rows_msg:
-        put_row(r["chat_id"], r["username"], r["title"], r["last_post"], r["hits"], r["views_sum"], r["fw_sum"], meta_boost=False)
+        put_row(r, meta_boost=False)
 
     for r in rows_meta:
         if int(r["chat_id"]) not in out_map:
-            put_row(r["chat_id"], r["username"], r["title"], r["last_post"], r["hits"], r["views_sum"], r["fw_sum"], meta_boost=True)
+            put_row(r, meta_boost=True)
 
     out = list(out_map.values())
 
@@ -639,7 +698,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
         out = filtered
 
     out.sort(key=lambda x: x["score"], reverse=True)
-    # анти-повторы на уровне каналов (минимально — по кэшированию сообщений они уже сработают)
     return {"total": len(out), "items": out[:limit]}
 
 # ============================== API ==============================
@@ -661,7 +719,6 @@ async def status():
 @app.get("/push_channels")
 async def push_channels(usernames: str = Query(..., description="comma-separated usernames"),
                         days: int = 180, per: int = 300):
-    """Ручное расширение: подтянуть список @usernames (через запятую) и закешировать посты"""
     us = [u.strip().lstrip("@") for u in usernames.split(",") if u.strip()]
     if not us:
         return {"ok": False, "error": "no usernames"}
@@ -677,10 +734,9 @@ async def push_channels(usernames: str = Query(..., description="comma-separated
                 except RPCError:
                     continue
             if not chans:
-                await push_usernames_to_queue(conn, us)  # хотя бы в очередь
+                await push_usernames_to_queue(conn, us)
                 return {"ok": True, "added": 0, "queued": len(us)}
             await live_backfill_messages(cli, conn, chans, days=days, per_channel=per)
-            # и ссылки из стартовых — в очередь
             for ch in chans:
                 await upsert_channel(conn, ch.id, getattr(ch,"username",None), getattr(ch,"title",None),
                                      "channel" if getattr(ch,"broadcast",False) else "supergroup")
@@ -711,6 +767,7 @@ async def search_messages(
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
     toks = tokens_for_like(q2)
+    intent = detect_intent(q)
 
     pool = await db()
     async with pool.acquire() as conn:
@@ -736,7 +793,7 @@ async def search_messages(
 
         return JSONResponse(await db_search_messages(
             conn, q2, chat, only_public, since, toks, only_promo, no_spam,
-            limit, offset, max_per_channel, user_key=u
+            limit, offset, max_per_channel, user_key=u, intent=intent
         ))
 
 @app.get("/search_chats")
@@ -753,6 +810,7 @@ async def search_chats(
     q2 = expand_query(q)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
     toks = tokens_for_like(q2)
+    intent = detect_intent(q)
 
     pool = await db()
     async with pool.acquire() as conn:
@@ -767,7 +825,7 @@ async def search_chats(
             except Exception as e:
                 logging.warning(f"Live channels failed: {e}")
 
-        res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit, user_key=u)
+        res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit, user_key=u, intent=intent)
         return JSONResponse(res)
 
 # ============================== ENTRYPOINT ==============================
