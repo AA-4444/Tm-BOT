@@ -155,6 +155,11 @@ def flood_left() -> int:
     """Сколько секунд осталось до снятия блокировки после FloodWait."""
     return int(max(0, _flood_block_until - time.time()))
 
+class AllSessionsFlooded(Exception):
+    def __init__(self, seconds: Optional[int] = None):
+        self.seconds = seconds
+        super().__init__(f"All sessions got FloodWait ({seconds}s)")
+
 def _is_valid_uname(u: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_]{4,32}", u or ""))
 
@@ -169,6 +174,8 @@ async def push_usernames_to_queue(conn, usernames: List[str]):
         INSERT INTO crawl_queue(username, last_try, tries) VALUES($1, NULL, 0)
         ON CONFLICT (username) DO NOTHING
     """, vals)
+    
+    
 
 def extract_usernames_from_text(txt: str) -> List[str]:
     found = []
@@ -210,7 +217,31 @@ class SessionPool:
 
 SESS_POOL = SessionPool(SESS_LIST)
 
+async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
+    """Пробует зарезолвить uname, перебирая сессии по кругу."""
+    max_tries = tries or len(SESS_LIST)
+    last_wait: Optional[int] = None
 
+    for i in range(max_tries):
+        cli = await SESS_POOL.client()
+        try:
+            async with cli:
+                return await cli.get_entity(uname)
+        except FloodWaitError as e:
+            last_wait = getattr(e, "seconds", None)
+            if last_wait:
+                _set_flood_block(last_wait)
+            logging.warning(
+                f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; "
+                f"block={last_wait if last_wait is not None else 'unknown'}s"
+            )
+            continue
+        except RPCError as e:
+            logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
+            continue
+
+    # Все сессии перепробованы — сигналим наружу своим исключением
+    raise AllSessionsFlooded(last_wait)
 
 # ============================== Live ops ==============================
 async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Channel], days: int, per_channel: int = 250):
@@ -300,7 +331,7 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in known_set])
 
         try:
-            # ВСЕ внутренние переменные объявляем ВНУТРИ try, а не снаружи
+            # все рабочие переменные — внутри try
             chans: List[Channel] = []
             bad: List[str] = []
             not_channel = 0
@@ -310,30 +341,44 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
                     bad.append(uname)
                     continue
                 try:
-                    # резолвим с ротацией сессий
+                    # резолв через ротацию сессий
                     ent = await resolve_entity_with_rotation(uname)
                     if isinstance(ent, Channel) and getattr(ent, "username", None):
                         chans.append(ent)
                     else:
                         not_channel += 1
                         bad.append(uname)
+
                 except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+                    # имени нет / некорректно → убрать из очереди
                     bad.append(uname)
-                except FloodWaitError:
-                    # глобальный блок уже выставлен — прерываем батч
+
+                except AllSessionsFlooded as e:
+                    # все сессии словили FloodWait — прерываем батч
+                    logging.warning(
+                        f"All sessions flooded while resolving @{uname}; block={e.seconds or flood_left()}s"
+                    )
+                    break
+
+                except FloodWaitError as e:
+                    # на всякий случай, если Telethon всё же кинет наружу
+                    _set_flood_block(getattr(e, "seconds", 30))
+                    logging.warning(
+                        f"Crawler: FloodWait on @{uname}, block={getattr(e,'seconds','unknown')}s"
+                    )
                     break
 
             ch_new = 0
             msg_new = 0
             if chans:
-                # для backfill открываем один клиент (любая сессия)
+                # для backfill достаточно одного клиента (любой сессии)
                 async with (await SESS_POOL.client()) as cli:
                     ch_new, msg_new = await live_backfill_messages(
                         cli, conn, chans, days=365, per_channel=per_channel
                     )
 
             if bad:
-                # удаляем «плохие»/не-канальные username из очереди
+                # удаляем «плохие» / не-канальные username из очереди
                 await drop_bad_usernames(conn, bad)
 
             logging.info(
@@ -343,9 +388,9 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             return (ch_new, msg_new, len(usernames))
 
         except FloodWaitError as e:
-            _set_flood_block(e.seconds)
-            logging.warning(f"Crawler: FloodWait outside loop, block={e.seconds}s")
-            return (0, 0, 0)     
+            _set_flood_block(getattr(e, "seconds", 30))
+            logging.warning(f"Crawler: FloodWait outside loop, block={getattr(e,'seconds','unknown')}s")
+            return (0, 0, 0)  
 
 
 
@@ -547,25 +592,7 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
 
 # ============================== Crawler / Queue ==============================
 
-async def resolve_entity_with_rotation(uname: str, tries: int = None):
-    """Пробует зарезолвить uname перебирая сессии по кругу."""
-    max_tries = tries or len(SESS_LIST)
-    for i in range(max_tries):
-        cli = await SESS_POOL.client()
-        try:
-            async with cli:
-                ent = await cli.get_entity(uname)
-                return ent
-        except FloodWaitError as e:
-            _set_flood_block(e.seconds)
-            logging.warning(f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; block={e.seconds}s")
-            continue  # пробуем следующую сессию
-        except RPCError as e:
-            logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
-            continue
-    # все сессии перепробованы — сдаёмся
-    # raise FloodWaitError(request=None, x=None, seconds=flood_left())
-    raise FloodWaitError(None, None, seconds=flood_left())
+
 
 async def crawl_once(seeds: list[str], per_channel: int = 500) -> Tuple[int,int,int]:
     """
