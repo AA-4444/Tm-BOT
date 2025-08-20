@@ -1,9 +1,6 @@
-# server.py
-# deps: fastapi uvicorn[standard] telethon asyncpg python-dotenv
-
-import os, asyncio, re, math, logging, random, time, hashlib
+import os, asyncio, re, math, logging, random, time, hashlib, json
 from datetime import timezone, datetime, timedelta
-from typing import Optional, Iterable, List, Tuple
+from typing import Optional, Iterable, List, Tuple, Dict, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -12,6 +9,9 @@ import asyncpg
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
+from telethon.errors.rpcerrorlist import (
+    UsernameNotOccupiedError, UsernameInvalidError, ChannelInvalidError
+)
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Message, MessageService
 
@@ -20,10 +20,14 @@ logging.basicConfig(level=logging.INFO)
 # ============================== ENV ==============================
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
-# один или много StringSession: TELEGRAM_STRING_SESSIONS="sess1,sess2,..." (пробелы можно)
+
+# one or many StringSession: TELEGRAM_STRING_SESSIONS="sess1,sess2,..." (spaces allowed)
 SESS_LIST = [s.strip() for s in os.getenv("TELEGRAM_STRING_SESSIONS","").split(",") if s.strip()]
 if not SESS_LIST and os.getenv("TELEGRAM_STRING_SESSION",""):
     SESS_LIST = [os.getenv("TELEGRAM_STRING_SESSION").strip()]
+
+if not API_ID or not API_HASH:
+    logging.warning("API_ID/API_HASH are not set; Telethon client will fail to login.")
 
 PG_DSN = os.getenv("DATABASE_URL","postgresql://postgres:postgres@localhost:5432/postgres")
 
@@ -33,11 +37,16 @@ LIVE_PER_CHANNEL_LIMIT = int(os.getenv("LIVE_PER_CHANNEL_LIMIT", "220"))
 LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 CRAWL_QUEUE_BATCH = int(os.getenv("CRAWL_QUEUE_BATCH", "120"))
 MAX_PARALLEL_CHANNELS = int(os.getenv("MAX_PARALLEL_CHANNELS", "6"))
+MAX_ITEMS_PER_QUERY = int(os.getenv("MAX_ITEMS_PER_QUERY", "2000"))
+DIVERSIFY_MAX_PER_CHANNEL = int(os.getenv("DIVERSIFY_MAX_PER_CHANNEL", "2"))
 
-app = FastAPI()
+# optional admin token for protected routes (NULL = disabled)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN","")
+
+app = FastAPI(title="TG Search API")
 _db_pool: asyncpg.Pool | None = None
 
-# глобальный «предохранитель» после FloodWait
+# global flood guard
 _flood_block_until: float = 0.0  # unix ts
 
 # ============================== DB DDL ==============================
@@ -64,7 +73,7 @@ CREATE TABLE IF NOT EXISTS messages(
   PRIMARY KEY(chat_id, message_id)
 );
 
--- кто/что уже показывали (анти-повторы)
+-- who/what we already served (anti-duplicates)
 CREATE TABLE IF NOT EXISTS served_hits(
   user_key TEXT,
   qhash TEXT,
@@ -74,14 +83,18 @@ CREATE TABLE IF NOT EXISTS served_hits(
   PRIMARY KEY(user_key, qhash, chat_id, message_id)
 );
 
--- очередь на краул новых юзернеймов/каналов
+-- usernames to be crawled
 CREATE TABLE IF NOT EXISTS crawl_queue(
   username TEXT PRIMARY KEY,
   last_try TIMESTAMPTZ,
   tries INT DEFAULT 0
 );
 
--- FTS (ru+en) и свежесть
+-- optional channel metadata
+ALTER TABLE channels
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+-- indexes
 CREATE INDEX IF NOT EXISTS ix_msg_tsv_ru ON messages
 USING GIN (to_tsvector('russian', coalesce(text,'')));
 
@@ -90,7 +103,6 @@ USING GIN (to_tsvector('english', coalesce(text,'')));
 
 CREATE INDEX IF NOT EXISTS ix_msg_date ON messages(date DESC);
 
--- триграммы (без unaccent в выражении, т.к. not immutable)
 CREATE INDEX IF NOT EXISTS ix_msg_trgm ON messages
 USING GIN ((lower(coalesce(text,''))) gin_trgm_ops);
 
@@ -107,42 +119,47 @@ async def db():
             await c.execute(DDL)
     return _db_pool
 
-# ============================== TOPIC SEEDS ==============================
-# Расширенные сиды по казино/игорке/аффилиатам
+# ============================== SEEDS ==============================
+# Rich seeds for casino / gambling / affiliates
 CASINO_BRANDS = [
     "1xbet","pin-up","pinnacle","joycasino","vulkan","parimatch","fonbet","leonbets",
     "bet365","ggbet","melbet","betfair","betway","winline","mostbet","888casino",
-    "pokerstars","partypoker","bet365 casino","unibet","22bet","mr green","lucky streak",
-    "stake","roobet","cloudbet","spinbetter","parimatch casino","playamo","bitstarz",
+    "pokerstars","partypoker","unibet","22bet","mr green","stake","roobet","cloudbet",
+    "playamo","bitstarz","golden star","parimatch casino","bwin","william hill",
+    "betcity","olymp bet","betsafe","dafabet","10bet","betano","pokerok","ggpoker",
+    "gg poker","betsson","ladbrokes","casumo","mr bet","national casino","hollywoodbets",
 ]
 
 AFF_NETWORKS = [
-    "cpa", "cpa gambling","affiliate casino","affiliate marketing","revshare","hybrid deal",
+    "cpa","cpa gambling","affiliate casino","affiliate marketing","revshare","hybrid deal",
     "apikings","alpha affiliates","leads.su","everad","adsterra","propellerads","leadbit",
     "clickdealer","maxbounty","awempire","traffic partners","gagarin partners","income access",
     "bet365 affiliates","parimatch affiliates","pinnacle affiliates","ggbet affiliates",
+    "mediabuying","affiliate network","ofer","offerwall","smartlink","tracking platform",
+    "hasoffers","voluum","keitaro","redtrack","binom tracker",
 ]
 
 CASINO_RU = [
     "казино","онлайн казино","фриспины","бесплатные вращения","бездепозитный бонус","промокод казино",
     "бонус казино","слоты","игровые автоматы","рулетка","блэкджек","покер","букмекер",
-    "ставки на спорт","беттинг","фрибет",
+    "ставки на спорт","беттинг","фрибет","кэшбек","выплаты","вывод средств",
 ]
 
 CASINO_EN = [
     "casino","gambling","free spins","bonus code","no deposit bonus","slots","slot machines",
-    "roulette","blackjack","poker","bookmaker","betting","freebet",
+    "roulette","blackjack","poker","bookmaker","betting","freebet","cashback","withdrawal",
 ]
 
-START_USERNAMES = [
-    # примеры, можно заполнить своими
-    # "ggbet", "parimatchru", "winline",
-]
-
-# Доп. широкие темы — помогают растянуть граф, но не используются в ранжировании казино
 GENERAL_WIDE_SEEDS = [
     "marketing","seo","smm","арбитраж трафика","трафик","промокод","скидки","купоны",
     "партнерская программа","заработок в интернете","рынок рекламы","influencer","контент маркетинг",
+    "диджитал","digital marketing","email marketing","push traffic","popunder","native ads",
+]
+
+# verified public channels to pre-seed crawl_queue (optional)
+START_USERNAMES = [
+    # examples (fill with your own to kickstart graph)
+    # "parimatchru","winline","1xstavka","pinupcasino","alpha_affiliates"
 ]
 
 SEEDS_ALL = list(dict.fromkeys(CASINO_BRANDS + AFF_NETWORKS + CASINO_RU + CASINO_EN + GENERAL_WIDE_SEEDS))
@@ -167,7 +184,8 @@ SPAM_NEG = re.compile(
     r"прогноз(ы)?\s*на\s*матч|ставк(и|а)\s*на\s*спорт|коэфф(ициент)?|odds|parlay)",
     re.I
 )
-TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,})\b|https?://t\.me/([a-zA-Z0-9_]{4,})\b")
+
+TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,32})\b|https?://t\.me/([a-zA-Z0-9_]{4,32})\b")
 
 def expand_query(q: str) -> str:
     ql = q.lower()
@@ -210,19 +228,19 @@ def normalize_query_for_hash(q: str) -> str:
 def qhash(q: str) -> str:
     return hashlib.md5(normalize_query_for_hash(q).encode("utf-8")).hexdigest()
 
-# ---------- Intent detection (affiliate / casino / jobs / generic) ----------
+# ---------- Intent detection ----------
 AFFILIATE_INCLUDE = [
     "affiliate","affiliates","aff","арбитраж","арбитраж трафика","партнерка","партнёрка",
-    "кэп", "кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
-    "media buying","buying","тимлид","сетка","сетка офферов","сеть офферов",
-    "traffic","трафик","nutra","gambling","беттинг","игорка","casino affiliate"
+    "ревшар","revshare","hybrid","cpa","lead","offer","оффер","media buying","buying",
+    "тимлид","team lead","тим лид","сетка офферов","smartlink","tracker","tracking",
+    "voluum","keitaro","redtrack","binom","spy tool","nutra","gambling","betting","игорка",
 ]
 AFFILIATE_EXCLUDE = [
     "free spins","фриспин","фриспины","промокод","бездеп","депозитный бонус","welcome bonus",
-    "ставки на спорт","фрибет"
+    "ставки на спорт","фрибет","розыгрыш","конкурс"
 ]
 
-JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","team lead","junior","middle","senior"]
+JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","junior","middle","senior"]
 JOBS_EXCLUDE = []
 
 CASINO_PROMO_INCLUDE = ["free spins","фриспины","бонус","промокод","no deposit","бездеп","cashback","кэшбек","welcome"]
@@ -237,7 +255,6 @@ def detect_intent(q: str):
         return dict(name="jobs", include=JOBS_INCLUDE, exclude=JOBS_EXCLUDE, strict=False, boost=0.25, penalty=0.0)
     if anyw(["casino","казино","фриспин","free spins","бонус","промокод"]):
         return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=False, boost=0.25, penalty=0.15)
-    # generic
     return dict(name="generic", include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
 
 # ============================== Live helpers (Telegram) ==============================
@@ -258,24 +275,6 @@ def _set_flood_block(seconds: int):
     global _flood_block_until
     _flood_block_until = time.time() + max(5, seconds)
 
-async def push_usernames_to_queue(conn, usernames: List[str]):
-    if not usernames: return
-    vals = [(u.lower(),) for u in set(usernames)]
-    await conn.executemany("""
-        INSERT INTO crawl_queue(username, last_try, tries) VALUES($1, NULL, 0)
-        ON CONFLICT (username) DO NOTHING
-    """, vals)
-
-TG_USERNAME_RE = re.compile(r"(?:^|[\s:;/\(\)\[\]\.,])@([a-zA-Z0-9_]{4,})\b|https?://t\.me/([a-zA-Z0-9_]{4,})\b")
-
-def extract_usernames_from_text(txt: str) -> List[str]:
-    found = []
-    for m in TG_USERNAME_RE.finditer(txt or ""):
-        u = (m.group(1) or m.group(2) or "").lower()
-        if u and 4 <= len(u) <= 32:
-            found.append(u)
-    return list(dict.fromkeys(found))
-
 # ============================== Session Pool ==============================
 class SessionPool:
     def __init__(self, sessions: List[str]):
@@ -283,12 +282,10 @@ class SessionPool:
         self.idx = 0
         if not self.sessions:
             raise RuntimeError("No TELEGRAM sessions provided")
-
     def next_session(self) -> StringSession:
         s = self.sessions[self.idx % len(self.sessions)]
         self.idx += 1
         return StringSession(s)
-
     async def client(self) -> TelegramClient:
         return TelegramClient(self.next_session(), API_ID, API_HASH)
 
@@ -359,7 +356,12 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
                 }
                 await upsert_message(conn, row)
 
-                # извлечём новые username из текста и добавим в очередь
+                # created_at backfill (first seen)
+                await conn.execute("""
+                    UPDATE channels c SET created_at = COALESCE(c.created_at, $2)
+                    WHERE c.chat_id = $1
+                """, ent.id, dt or datetime.now(timezone.utc))
+
                 if text:
                     us = extract_usernames_from_text(text)
                     if us:
@@ -369,7 +371,7 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-# ============================== Crawler / Queue ==============================
+# ============================== Crawl / Queue ==============================
 async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATCH):
     if _flood_blocked():
         return
@@ -387,20 +389,31 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             "UPDATE crawl_queue SET last_try=NOW(), tries=COALESCE(tries,0)+1 WHERE username=$1",
             [(u,) for u in usernames]
         )
+
+        to_delete: list[tuple[str]] = []
+        chans: List[Channel] = []
+
         try:
             async with (await SESS_POOL.client()) as cli:
-                chans: List[Channel] = []
                 for uname in usernames:
                     try:
                         ent = await cli.get_entity(uname)
                         if isinstance(ent, Channel) and getattr(ent,"username",None):
                             chans.append(ent)
+                        else:
+                            to_delete.append((uname,))
+                    except (UsernameNotOccupiedError, UsernameInvalidError, ChannelInvalidError, ValueError):
+                        to_delete.append((uname,))
+                    except FloodWaitError as e:
+                        _set_flood_block(e.seconds)
+                        break
                     except RPCError:
                         continue
                 if chans:
                     await live_backfill_messages(cli, conn, chans, days=365, per_channel=per_channel)
-        except FloodWaitError as e:
-            _set_flood_block(e.seconds)
+        finally:
+            if to_delete:
+                await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", to_delete)
 
 async def crawl_once(seeds: list[str], per_channel: int = 500):
     if _flood_blocked():
@@ -432,7 +445,7 @@ async def crawler_loop():
         await asyncio.sleep(60*20)
 
 # ============================== Common search helpers ==============================
-def _diversify(items: list[dict], max_per_channel: int = 2) -> list[dict]:
+def _diversify(items: list[dict], max_per_channel: int = DIVERSIFY_MAX_PER_CHANNEL) -> list[dict]:
     seen = {}
     out = []
     for it in items:
@@ -486,7 +499,6 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
              m.views, m.forwards,
              c.username, c.title,
              lower(regexp_replace(coalesce(m.text,''), '\s+', ' ', 'g')) AS norm,
-             -- intent keywords
              (cardinality($6::text[]) = 0 OR EXISTS (
                 SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
              )) AS kw_incl,
@@ -532,8 +544,8 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
            chat_id, username, title, message_id, date, text, views, forwards, ft_score
     FROM scored
     ORDER BY chat_id, norm_hash, date DESC
-    LIMIT 2000
-    """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty)
+    LIMIT $11
+    """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty, MAX_ITEMS_PER_QUERY)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -581,7 +593,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     boost = float(intent.get("boost", 0.0))
     penalty = float(intent.get("penalty", 0.0))
 
-    # 1) По сообщениям (с intent-сигналами на уровне сообщений)
     rows_msg = await conn.fetch(r"""
     WITH cand AS (
       SELECT m.chat_id, m.date, m.text, m.views, m.forwards,
@@ -628,7 +639,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     LIMIT 1000
     """, q2, since, inc, exc, toks, only_public, strict)
 
-    # 2) По названию/username
     rows_meta = await conn.fetch(r"""
     SELECT chat_id, username, title, NOW()::timestamptz AS last_post,
            0::bigint AS hits, 0::bigint AS views_sum, 0::bigint AS fw_sum,
@@ -643,7 +653,7 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     """, q2)
 
     now = datetime.now(timezone.utc)
-    out_map: dict[int, dict] = {}
+    out_map: Dict[int, Dict[str, Any]] = {}
 
     def put_row(row, meta_boost=False):
         chat_id = int(row["chat_id"])
@@ -671,14 +681,13 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
 
     for r in rows_msg:
         put_row(r, meta_boost=False)
-
     for r in rows_meta:
         if int(r["chat_id"]) not in out_map:
             put_row(r, meta_boost=True)
 
     out = list(out_map.values())
 
-    # фильтры по последним 30 сообщениям
+    # filters on latest 30 posts
     if only_promo or no_spam:
         filtered = []
         for ch in out:
@@ -716,6 +725,23 @@ async def status():
         "last_message_at": last_dt.isoformat() if last_dt else None
     }
 
+@app.get("/stats/growth")
+async def stats_growth():
+    pool = await db()
+    async with pool.acquire() as conn:
+        ch_total = await conn.fetchval("SELECT COUNT(*) FROM channels")
+        ch_new7  = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE created_at > now()-interval '7 days'")
+        ch_24h   = await conn.fetchval("SELECT COUNT(DISTINCT chat_id) FROM messages WHERE date > now() - interval '24 hours'")
+        msg_24h  = await conn.fetchval("SELECT COUNT(*) FROM messages WHERE date > now() - interval '24 hours'")
+        qsize    = await conn.fetchval("SELECT COUNT(*) FROM crawl_queue")
+    return {
+        "channels_total": ch_total,
+        "channels_new_7d": ch_new7,
+        "channels_touched_24h": ch_24h,
+        "messages_24h": msg_24h,
+        "queue_size": qsize,
+    }
+
 @app.get("/push_channels")
 async def push_channels(usernames: str = Query(..., description="comma-separated usernames"),
                         days: int = 180, per: int = 300):
@@ -729,7 +755,7 @@ async def push_channels(usernames: str = Query(..., description="comma-separated
             for uname in us:
                 try:
                     ent = await cli.get_entity(uname)
-                    if isinstance(ent, Channel):
+                    if isinstance(ent, Channel) and getattr(ent,"username",None):
                         chans.append(ent)
                 except RPCError:
                     continue
@@ -760,7 +786,7 @@ async def search_messages(
     no_spam: bool = True,
     limit: int = 20,
     offset: int = 0,
-    max_per_channel: int = 2,
+    max_per_channel: int = DIVERSIFY_MAX_PER_CHANNEL,
     live: bool = True,
     u: Optional[str] = Query(None, description="user key for anti-repeats"),
 ):
@@ -771,7 +797,6 @@ async def search_messages(
 
     pool = await db()
     async with pool.acquire() as conn:
-        # LIVE накрутка базы перед выдачей
         if live and not _flood_blocked():
             try:
                 async with (await SESS_POOL.client()) as cli:
@@ -828,6 +853,21 @@ async def search_chats(
         res = await db_search_chats(conn, q2, only_public, since, toks, only_promo, no_spam, limit, user_key=u, intent=intent)
         return JSONResponse(res)
 
+# --------- Admin/Debug (optional) ---------
+@app.get("/debug/flood")
+async def debug_flood():
+    return {"flood_blocked": _flood_blocked(), "unblock_in_sec": max(0, int(_flood_block_until - time.time()))}
+
+@app.get("/admin/reindex")
+async def admin_reindex(token: Optional[str] = Query(None)):
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=403)
+    pool = await db()
+    async with pool.acquire() as conn:
+        # cheap "touch" to ensure DDL exists; true reindex is heavy and not done here
+        await conn.execute("SELECT 1")
+    return {"ok": True}
+
 # ============================== ENTRYPOINT ==============================
 async def check_session():
     async with (await SESS_POOL.client()) as cli:
@@ -839,7 +879,7 @@ async def main():
     loop = asyncio.get_running_loop()
     await check_session()
 
-    # заранее: стартовые username — в очередь
+    # preseed queue
     if START_USERNAMES:
         pool = await db()
         async with pool.acquire() as conn:
