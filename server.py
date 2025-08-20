@@ -140,6 +140,17 @@ USING GIN ((lower(coalesce(text,''))) gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS ix_chan_name_ru ON channels
 USING GIN (to_tsvector('russian', coalesce(title,'')));
+
+
+CREATE TABLE IF NOT EXISTS external_usernames (
+  username   TEXT PRIMARY KEY,
+  sources    TEXT[] DEFAULT '{}',
+  first_seen TIMESTAMPTZ DEFAULT NOW(),
+  last_seen  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_external_last_seen ON external_usernames(last_seen DESC);
+CREATE INDEX IF NOT EXISTS ix_external_sources_gin ON external_usernames USING GIN (sources);
 """
 
 async def db():
@@ -184,7 +195,29 @@ async def push_usernames_to_queue(conn, usernames: List[str]):
         ON CONFLICT (username) DO NOTHING
     """, vals)
     
+async def upsert_external_usernames(conn, usernames: List[str], source: str) -> int:
+  
+    if not usernames:
+        return 0
+    rows = [(u, source) for u in usernames if _is_valid_uname(u)]
+    if not rows:
+        return 0
+
+    await conn.executemany("""
+        INSERT INTO external_usernames(username, sources)
+        VALUES($1, ARRAY[$2]::text[])
+        ON CONFLICT (username) DO UPDATE
+        SET last_seen = NOW(),
+            sources   = CASE
+                          WHEN external_usernames.sources @> ARRAY[$2]::text[]
+                          THEN external_usernames.sources
+                          ELSE array_append(external_usernames.sources, $2)
+                        END
+    """, rows)
+    return len(rows)
     
+
+
 
 def extract_usernames_from_text(txt: str) -> List[str]:
     found = []
@@ -193,6 +226,23 @@ def extract_usernames_from_text(txt: str) -> List[str]:
         if u and _is_valid_uname(u):
             found.append(u)
     return list(dict.fromkeys(found))
+
+def extract_usernames_from_any_text(raw: str) -> List[str]:
+
+    if not raw:
+        return []
+    found = set()
+
+    # @name и t.me/name
+    pat_links = re.compile(r"(?:@|https?://t\.me/)([A-Za-z0-9_]{4,32})", re.I)
+    found |= {m.group(1).lower() for m in pat_links.finditer(raw)}
+
+    # «голые» токены (опция)
+    simple = {x.lower() for x in re.findall(r"\b[A-Za-z0-9_]{4,32}\b", raw)}
+    blacklist = {"joinchat", "addstickers", "socks", "iv", "share", "proxy"}
+    found |= (simple - blacklist)
+
+    return [u for u in found if _is_valid_uname(u)]
 
 async def drop_bad_usernames(conn, usernames: List[str]):
     if not usernames:
@@ -719,6 +769,91 @@ async def crawler_loop():
         await asyncio.sleep(max(10, CRAWLER_SLEEP_SECONDS)) 
         
 
+async def auto_seeder_loop():
+    # выключатель
+    if not AUTO_SEED_ENABLED:
+        logging.info("Auto-seeder: disabled (AUTO_SEED_ENABLED=0)")
+        return
+
+    # список URL из ENV (через запятую), без дублей и пустых
+    urls = [u.strip() for u in (AUTO_SEED_SOURCES or "").split(",") if u.strip()]
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        logging.info("Auto-seeder: no URLs in AUTO_SEED_SOURCES")
+        return
+
+    logging.info(f"Auto-seeder: enabled; {len(urls)} sources; every {AUTO_SEED_INTERVAL_SEC}s")
+
+    # нормальные заголовки и общий таймаут сессии
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+    timeout = aiohttp.ClientTimeout(total=float(AUTO_SEED_FETCH_TIMEOUT))
+
+    while True:
+        try:
+            pool = await db()
+            total_queued = 0
+
+            async with aiohttp.ClientSession(
+                raise_for_status=False,
+                headers=headers,
+                timeout=timeout
+            ) as session:
+
+                for url in urls:
+                    # лёгкая пауза между запросами + джиттер
+                    await asyncio.sleep(max(0.1, AUTO_SEED_PER_URL_DELAY) + random.random() * 0.5)
+
+                    try:
+                        logging.info(f"Auto-seeder: fetch {url}")
+                        async with session.get(url, allow_redirects=True) as r:
+                            status = r.status
+                            if status in (403, 429):
+                                logging.warning(f"Auto-seeder: HTTP {status} on {url}, backing off")
+                                await asyncio.sleep(5 + random.random() * 5)
+                                continue
+
+                            content = await r.content.read(AUTO_SEED_MAX_BYTES)
+                            try:
+                                text = content.decode("utf-8", errors="ignore")
+                            except Exception:
+                                text = content.decode("latin-1", errors="ignore")
+
+                        # вытащить username-ы из сырого HTML/текста
+                        unames = extract_usernames_from_any_text(text)
+                        if not unames:
+                            logging.info(f"Auto-seeder: no usernames found in {url}")
+                            continue
+
+                        async with pool.acquire() as conn:
+                            # 1) мгновенно фиксируем все имена в staging-таблицу
+                            staged = await upsert_external_usernames(conn, unames, source=url)
+                            # 2) плюс — ставим в очередь для MTProto-краулера
+                            await push_usernames_to_queue(conn, unames)
+
+                            total_queued += len(unames)
+                            logging.info(f"Auto-seeder: staged={staged} queued={len(unames)} from {url}")
+
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Auto-seeder: timeout fetching {url}")
+                    except Exception as e:
+                        logging.warning(f"Auto-seeder: error fetching {url}: {e}")
+
+            logging.info(f"Auto-seeder: cycle done; queued total={total_queued}")
+
+        except Exception as e:
+            logging.error(f"Auto-seeder loop error: {e}")
+
+        # пауза до следующего цикла
+        await asyncio.sleep(max(60, AUTO_SEED_INTERVAL_SEC))
+
 # ============================== Common search helpers ==============================
 def _diversify(items: list[dict], max_per_channel: int = 2) -> list[dict]:
     seen = {}
@@ -994,14 +1129,21 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
 async def status():
     pool = await db()
     async with pool.acquire() as conn:
-        ch_cnt = await conn.fetchval("SELECT count(*) FROM channels")
+        ch_cnt  = await conn.fetchval("SELECT count(*) FROM channels")
         msg_cnt = await conn.fetchval("SELECT count(*) FROM messages")
         last_dt = await conn.fetchval("SELECT max(date) FROM messages")
-        qcnt  = await conn.fetchval("SELECT count(*) FROM crawl_queue")
+        qcnt    = await conn.fetchval("SELECT count(*) FROM crawl_queue")
+        # новое: сколько уже зафиксировано в staging-таблице из внешних источников
+        try:
+            ext_cnt = await conn.fetchval("SELECT count(*) FROM external_usernames")
+        except Exception:
+            ext_cnt = None  # если таблица ещё не создана
+
     return {
         "channels": int(ch_cnt or 0),
         "messages": int(msg_cnt or 0),
         "queue": int(qcnt or 0),
+        "external_usernames": (int(ext_cnt) if ext_cnt is not None else None),
         "last_message_at": last_dt.isoformat() if last_dt else None
     }
 
@@ -1212,6 +1354,9 @@ async def main():
     if RUN_CRAWLER:
         logging.info("Starting crawler loop…")
         loop.create_task(crawler_loop())
+    if AUTO_SEED_ENABLED:
+        logging.info("Starting auto-seeder loop…")
+        loop.create_task(auto_seeder_loop())
 
     config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")))
     server = uvicorn.Server(config)
