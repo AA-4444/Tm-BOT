@@ -156,8 +156,14 @@ CREATE INDEX IF NOT EXISTS ix_external_sources_gin ON external_usernames USING G
 async def db():
     global _db_pool
     if _db_pool is None:
-        _db_pool = await asyncpg.create_pool(dsn=PG_DSN, min_size=1, max_size=10)
-        async with _db_pool.acquire() as c:
+       _db_pool = await asyncpg.create_pool(
+             dsn=PG_DSN,
+             min_size=0,                       
+             max_size=5,                     
+             max_inactive_connection_lifetime=30.0,  
+              timeout=30.0,
+            )
+    async with _db_pool.acquire() as c:
             await c.execute(DDL)
     return _db_pool
 
@@ -737,37 +743,51 @@ async def _db_counts(conn) -> Tuple[int,int,int]:
     return int(ch_cnt or 0), int(msg_cnt or 0), int(qcnt or 0)
 
 async def crawler_loop():
-    seeds = list(dict.fromkeys(SEEDS_ALL))
+    # базовая пауза читается из ENV, но будем её адаптивно растягивать
+    base_sleep = max(10, CRAWLER_SLEEP_SECONDS)
+    sleep_now = base_sleep
+    max_sleep = max(base_sleep, int(os.getenv("CRAWLER_MAX_SLEEP_SECONDS", "1800")))  # до 30 мин
+
     while True:
         try:
-            pool = await db()
-            async with pool.acquire() as conn:
-                ch_before, msg_before, q_before = await _db_counts(conn)
+            # Если глобально заблокированы по FloodWait — не трогаем БД вообще
+            if _flood_blocked():
+                left = flood_left()
+                logging.info(f"Crawler: FloodWait; sleeping {left}s without touching DB")
+                await asyncio.sleep(max(5, left))
+                # Не увеличиваем sleep_now сверх base — Flood сам регулирует паузу
+                sleep_now = min(sleep_now * 2, max_sleep)
+                continue
 
-            logging.info("Crawler: cycle start")
+            # --- Основная работа ---
 
-            ch_add_q, msg_add_q, processed = await crawl_from_queue(per_channel=350, batch=CRAWL_QUEUE_BATCH)
+            # 1) Очередь username'ов
+            ch_add_q, msg_add_q, processed = await crawl_from_queue(
+                per_channel=350, batch=CRAWL_QUEUE_BATCH
+            )
             logging.info(f"Crawler: from queue processed={processed}, new_channels={ch_add_q}, new_messages={msg_add_q}")
 
-            ch_add_s, msg_add_s, qrun = await crawl_once(seeds, per_channel=320)
+            # 2) Плановые сиды
+            ch_add_s, msg_add_s, qrun = await crawl_once(SEEDS_ALL, per_channel=320)
             logging.info(f"Crawler: seeds queries_run={qrun}, new_channels={ch_add_s}, new_messages={msg_add_s}")
 
-            async with (await db()).acquire() as conn2:
-                ch_after, msg_after, q_after = await _db_counts(conn2)
+            added_total = (ch_add_q + ch_add_s) + (msg_add_q + msg_add_s)
 
-            logging.info(
-                "Crawler: cycle end | added_channels=%d added_messages=%d | totals: channels=%d(+%d) messages=%d(+%d) queue=%d",
-                ch_add_q + ch_add_s,
-                msg_add_q + msg_add_s,
-                ch_after, ch_after - ch_before,
-                msg_after, msg_after - msg_before,
-                q_after
-            )
+            # --- Адаптивный бэкофф ---
+            if added_total == 0 and processed == 0 and qrun == 0:
+                # Совсем не было прогресса — увеличим паузу (экпоненциально, но с потолком)
+                sleep_now = min(sleep_now * 2, max_sleep)
+                logging.info(f"Crawler: no progress, backoff sleep={sleep_now}s")
+            else:
+                # Был прогресс — возвращаемся к базовой паузе
+                sleep_now = base_sleep
+
         except Exception as e:
             logging.error(f"Crawler error: {e}")
+            # При ошибке чуть подрастим паузу, чтобы не долбить
+            sleep_now = min(max(30, int(sleep_now * 1.5)), max_sleep)
 
-        await asyncio.sleep(max(10, CRAWLER_SLEEP_SECONDS)) 
-        
+        await asyncio.sleep(sleep_now)
 
 async def auto_seeder_loop():
     # выключатель
@@ -1225,7 +1245,7 @@ async def search_messages(
     limit: int = 20,
     offset: int = 0,
     max_per_channel: int = 2,
-    live: bool = True,
+    live: bool = False,
     u: Optional[str] = Query(None, description="user key for anti-repeats"),
 ):
     q2 = expand_query(q)
@@ -1291,7 +1311,7 @@ async def search_chats(
     only_public: bool = True,
     no_spam: bool = True,
     limit: int = 15,
-    live: bool = True,
+    live: bool = False,
     u: Optional[str] = Query(None, description="user key (optional)"),
 ):
     q2 = expand_query(q)
