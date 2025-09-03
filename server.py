@@ -22,12 +22,9 @@ logging.basicConfig(level=logging.INFO)
 API_ID  = int(os.getenv("API_ID","0"))
 API_HASH = os.getenv("API_HASH","")
 
-
-
 def load_sessions_from_env() -> list[str]:
     sessions: list[str] = []
 
-    # JSON-массив (опционально): TELEGRAM_STRING_SESSIONS_JSON='["sess1","sess2"]'
     raw_json = os.getenv("TELEGRAM_STRING_SESSIONS_JSON", "")
     if raw_json.strip():
         try:
@@ -37,7 +34,6 @@ def load_sessions_from_env() -> list[str]:
         except Exception as e:
             logging.warning(f"Bad TELEGRAM_STRING_SESSIONS_JSON: {e}")
 
-    # Одна строка с разделителями , ; | или перенос строки
     raw = os.getenv("TELEGRAM_STRING_SESSIONS", "")
     if raw.strip():
         for part in re.split(r"[\n,;|]+", raw):
@@ -45,19 +41,16 @@ def load_sessions_from_env() -> list[str]:
             if part:
                 sessions.append(part)
 
-    # Несколько переменных: TELEGRAM_SESSION_1, TELEGRAM_SESSION_2, ...
     for k, v in os.environ.items():
         if k.startswith("TELEGRAM_SESSION_") or k.startswith("TG_SESSION_"):
             v = (v or "").strip()
             if v:
                 sessions.append(v)
 
-    # Одиночная переменная на всякий случай
     single = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
     if single:
         sessions.append(single)
 
-    # dedupe, preserve order
     return list(dict.fromkeys([s for s in sessions if s]))
 
 SESS_LIST = load_sessions_from_env()
@@ -76,11 +69,11 @@ CRAWL_QUEUE_BATCH = int(os.getenv("CRAWL_QUEUE_BATCH", "120"))
 MAX_PARALLEL_CHANNELS = int(os.getenv("MAX_PARALLEL_CHANNELS", "6"))
 CRAWLER_SLEEP_SECONDS = int(os.getenv("CRAWLER_SLEEP_SECONDS", "120"))
 AUTO_SEED_ENABLED = os.getenv("AUTO_SEED_ENABLED", "0").lower() in ("1", "true", "yes")
-AUTO_SEED_SOURCES = os.getenv("AUTO_SEED_SOURCES", "https://tgstat.com/ru/top-channels,https://tgstat.com/ru/categories/news,https://tgstat.com/ru/categories/technology,https://tgstat.com/ru/categories/entertainment,https://tgstat.com/ru/categories/business")  # список URL 
-AUTO_SEED_INTERVAL_SEC = int(os.getenv("AUTO_SEED_INTERVAL_SEC", "21600"))  
-AUTO_SEED_PER_URL_DELAY = float(os.getenv("AUTO_SEED_PER_URL_DELAY", "0.7"))  
-AUTO_SEED_FETCH_TIMEOUT = int(os.getenv("AUTO_SEED_FETCH_TIMEOUT", "20"))  
-AUTO_SEED_MAX_BYTES = int(os.getenv("AUTO_SEED_MAX_BYTES", "5242880"))  
+AUTO_SEED_SOURCES = os.getenv("AUTO_SEED_SOURCES", "https://tgstat.com/ru/top-channels,https://tgstat.com/ru/categories/news,https://tgstat.com/ru/categories/technology,https://tgstat.com/ru/categories/entertainment,https://tgstat.com/ru/categories/business")
+AUTO_SEED_INTERVAL_SEC = int(os.getenv("AUTO_SEED_INTERVAL_SEC", "21600"))
+AUTO_SEED_PER_URL_DELAY = float(os.getenv("AUTO_SEED_PER_URL_DELAY", "0.7"))
+AUTO_SEED_FETCH_TIMEOUT = int(os.getenv("AUTO_SEED_FETCH_TIMEOUT", "20"))
+AUTO_SEED_MAX_BYTES = int(os.getenv("AUTO_SEED_MAX_BYTES", "5242880"))
 
 app = FastAPI()
 _db_pool: asyncpg.Pool | None = None
@@ -141,7 +134,6 @@ USING GIN ((lower(coalesce(text,''))) gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS ix_chan_name_ru ON channels
 USING GIN (to_tsvector('russian', coalesce(title,'')));
 
-
 CREATE TABLE IF NOT EXISTS external_usernames (
   username   TEXT PRIMARY KEY,
   sources    TEXT[] DEFAULT '{}',
@@ -158,10 +150,10 @@ async def db():
     if _db_pool is None:
        _db_pool = await asyncpg.create_pool(
              dsn=PG_DSN,
-             min_size=0,                       
-             max_size=5,                     
-             max_inactive_connection_lifetime=30.0,  
-              timeout=30.0,
+             min_size=0,
+             max_size=5,
+             max_inactive_connection_lifetime=30.0,
+             timeout=30.0,
             )
     async with _db_pool.acquire() as c:
             await c.execute(DDL)
@@ -176,9 +168,8 @@ def _flood_blocked() -> bool:
 def _set_flood_block(seconds: int):
     global _flood_block_until
     _flood_block_until = time.time() + max(5, seconds)
-    
+
 def flood_left() -> int:
-    """Сколько секунд осталось до снятия блокировки после FloodWait."""
     return int(max(0, _flood_block_until - time.time()))
 
 class AllSessionsFlooded(Exception):
@@ -200,9 +191,8 @@ async def push_usernames_to_queue(conn, usernames: List[str]):
         INSERT INTO crawl_queue(username, last_try, tries) VALUES($1, NULL, 0)
         ON CONFLICT (username) DO NOTHING
     """, vals)
-    
+
 async def upsert_external_usernames(conn, usernames: List[str], source: str) -> int:
-  
     if not usernames:
         return 0
     rows = [(u, source) for u in usernames if _is_valid_uname(u)]
@@ -221,9 +211,6 @@ async def upsert_external_usernames(conn, usernames: List[str], source: str) -> 
                         END
     """, rows)
     return len(rows)
-    
-
-
 
 def extract_usernames_from_text(txt: str) -> List[str]:
     found = []
@@ -234,16 +221,13 @@ def extract_usernames_from_text(txt: str) -> List[str]:
     return list(dict.fromkeys(found))
 
 def extract_usernames_from_any_text(raw: str) -> List[str]:
-
     if not raw:
         return []
     found = set()
 
-    # @name и t.me/name
     pat_links = re.compile(r"(?:@|https?://t\.me/)([A-Za-z0-9_]{4,32})", re.I)
     found |= {m.group(1).lower() for m in pat_links.finditer(raw)}
 
-    # «голые» токены (опция)
     simple = {x.lower() for x in re.findall(r"\b[A-Za-z0-9_]{4,32}\b", raw)}
     blacklist = {"joinchat", "addstickers", "socks", "iv", "share", "proxy"}
     found |= (simple - blacklist)
@@ -256,7 +240,6 @@ async def drop_bad_usernames(conn, usernames: List[str]):
     await conn.executemany("DELETE FROM crawl_queue WHERE username=$1", [(u,) for u in set(usernames)])
 
 # ============================== Session Pool ==============================
-# ============================== Session Pool ==============================
 class SessionPool:
     def __init__(self, sessions: List[str]):
         self.sessions = [s for s in sessions if s]
@@ -267,12 +250,10 @@ class SessionPool:
     def next_session(self) -> StringSession:
         s = self.sessions[self.idx % len(self.sessions)]
         self.idx += 1
-        # просто для трейсинга какая сессия (номер)
         logging.info(f"Using TG session #{(self.idx - 1) % len(self.sessions) + 1}")
         return StringSession(s)
 
     async def client(self) -> TelegramClient:
-        # важно: отключаем авто-сон Telethon, пусть бросает FloodWaitError
         return TelegramClient(
             self.next_session(),
             API_ID,
@@ -284,35 +265,26 @@ SESS_POOL = SessionPool(SESS_LIST)
 
 # ============================== Crawler / Queue helpers ==============================
 _BACKOFF_BY_SESSION: dict[int, float] = {}
-_MIN_ROTATION_DELAY = float(os.getenv("MIN_ROTATION_DELAY", "0.3"))   # базовая пауза между попытками
-_JITTER_MAX = float(os.getenv("ROTATION_JITTER_MAX", "0.4"))          # случайный джиттер
-_PER_SESSION_COOLDOWN = float(os.getenv("PER_SESSION_COOLDOWN", "8")) # локальный кулдаун для сессии при Flood
+_MIN_ROTATION_DELAY = float(os.getenv("MIN_ROTATION_DELAY", "0.3"))
+_JITTER_MAX = float(os.getenv("ROTATION_JITTER_MAX", "0.4"))
+_PER_SESSION_COOLDOWN = float(os.getenv("PER_SESSION_COOLDOWN", "8"))
 
 async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
-    """
-    Аккуратно резолвит uname, перебирая сессии по кругу, с микро-паузами и
-    локальным (per-session) backoff, чтобы резко не выбиваться в FloodWait.
-    Если все сессии словили Flood — кидает наш AllSessionsFlooded(seconds).
-    """
     max_tries = tries or len(SESS_LIST)
     last_wait: Optional[int] = None
     used_sessions: list[int] = []
 
     for i in range(max_tries):
-        # какая именно по счёту сессия (индекс) сейчас будет
         sess_idx = SESS_POOL.idx % len(SESS_LIST)
         used_sessions.append(sess_idx)
 
-        # per-session локальный кулдаун
         now = time.time()
         next_ok = _BACKOFF_BY_SESSION.get(sess_idx, 0.0)
         if now < next_ok:
-            # чуть спим, чтобы не долбить именно эту сессию
             await asyncio.sleep(min(1.5, next_ok - now))
 
         cli = await SESS_POOL.client()
         try:
-            # небольшой “человеческий” интервал + джиттер
             await asyncio.sleep(_MIN_ROTATION_DELAY + random.random() * _JITTER_MAX)
 
             async with cli:
@@ -320,28 +292,22 @@ async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
                 return ent
 
         except FloodWaitError as e:
-            # глобальный предохранитель (для всего процесса)
             sec = int(getattr(e, "seconds", 30) or 30)
             last_wait = sec
             _set_flood_block(sec)
-
-            # локальный предохранитель (только для этой сессии)
             _BACKOFF_BY_SESSION[sess_idx] = time.time() + max(_PER_SESSION_COOLDOWN, min(sec, 180))
-
             logging.warning(
                 f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; block={sec}s; session={sess_idx+1}"
             )
             continue
 
         except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
-            # имя не занято / некорректное — отдаём наверх, чтобы вызвать drop из очереди
             raise e
 
         except RPCError as e:
             logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
             continue
 
-    # если сюда пришли — перебрали все попытки, но не удалось
     raise AllSessionsFlooded(last_wait)
 
 # ============================== Live ops ==============================
@@ -369,7 +335,6 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
                 new_channels += 1
 
             async for msg in cli.iter_messages(ent, limit=per_channel):
-                # ⬇️ вот сюда вставляем проверку даты
                 if msg.date and msg.date.tzinfo and msg.date < since_dt:
                     break
 
@@ -393,12 +358,9 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
 
     await asyncio.gather(*[_one(ch) for ch in channels], return_exceptions=True)
     return new_channels, new_messages
+
 # ============================== Crawl Queue ==============================
 async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATCH) -> Tuple[int,int,int]:
-    """
-    Обрабатывает usernames из таблицы очереди.
-    Возвращает (new_channels, new_messages, processed_usernames)
-    """
     if _flood_blocked():
         logging.info(f"Crawler: queue skipped due to FloodWait; left={flood_left()}s")
         return (0, 0, 0)
@@ -450,14 +412,12 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
                     bad.append(uname)
 
                 except AllSessionsFlooded as e:
-                    # глобально стопаем батч — выставили предохранитель внутри resolve
                     logging.warning(
                         f"All sessions flooded while resolving @{uname}; block={e.seconds or flood_left()}s"
                     )
                     break
 
                 except FloodWaitError as e:
-                    # на всякий случай, если Telethon что-то выкинул напрямую
                     sec = int(getattr(e, "seconds", 30) or 30)
                     _set_flood_block(sec)
                     logging.warning(f"Crawler: FloodWait on @{uname}, block={sec}s")
@@ -486,9 +446,7 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             logging.warning(f"Crawler: FloodWait outside loop, block={sec}s")
             return (0, 0, 0)
 
-
 # ============================== TOPIC SEEDS ==============================
-# Расширенные сиды по казино/игорке/аффилиатам
 CASINO_BRANDS = [
     "1xbet","pin-up","pinnacle","joycasino","vulkan","parimatch","fonbet","leonbets",
     "bet365","ggbet","melbet","betfair","betway","winline","mostbet","888casino",
@@ -515,11 +473,9 @@ CASINO_EN = [
 ]
 
 START_USERNAMES = [
-    # примеры, можно заполнить своими
     # "ggbet", "parimatchru", "winline",
 ]
 
-# Доп. широкие темы — помогают растянуть граф, но не используются в ранжировании казино
 GENERAL_WIDE_SEEDS = [
     "marketing","seo","smm","арбитраж трафика","трафик","промокод","скидки","купоны",
     "партнерская программа","заработок в интернете","рынок рекламы","influencer","контент маркетинг",
@@ -527,42 +483,57 @@ GENERAL_WIDE_SEEDS = [
 
 SEEDS_ALL = list(dict.fromkeys(CASINO_BRANDS + AFF_NETWORKS + CASINO_RU + CASINO_EN + GENERAL_WIDE_SEEDS))
 
-# ============================== Helpers ==============================
-SYNONYMS = {
-    r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
-    r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
-    r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
-    r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
-    r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
-    r"\baffiliate\b": ["aff", "арбитраж", "партнерка", "партнёрка", "revshare", "hybrid", "cpa", "cpa gambling", "affiliate marketing"],
-    r"\bарбитраж\b": ["traffic", "арбитраж трафика", "affiliate", "aff", "cpa"],
-    r"\bпромокод\b": ["bonus code", "promo", "coupon", "код"],
-}
+# ============================== Helpers (scoring & filters) ==============================
+# Жёсткий казино-контекст + промо
+CASINO_CTX = re.compile(
+    r"(казино|casino|gambl\w*|слот(ы|ов)?|slots?|игров(ы|о)е?\s*автомат(ы|ов)?|рулетк|blackjack|покер|букмекер|ставк[аи]|betting|free\s*bet|фрибет)",
+    re.I,
+)
 
-PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп(озит)|депозит\s*бонус|welcome|фриспин|cash\s*back|кэшбек|промо)", re.I)
-PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
+PROMO_POS = re.compile(
+    r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|no\s*deposit|бездеп(озит)?|cash\s*back|кэшбек|welcome|депозит(ный)?\s*бонус)",
+    re.I,
+)
+
+PROMO_NEG = re.compile(
+    r"(мем|шутк|юмор|сарказм|ирони|прикол|"
+    r"сбербанк|тинькофф|монобанк|приватбанк|карта\s*для\s*детей|"
+    r"нова(я)?\s*почт[аы]|nova\s*poshta|почта\s*россии|delivery|доставка|"
+    r"tv\s*shows?|movies?|стрим(инг)?|расписани[ея]|трансляц|матч|лига|schedule|fixtures)",
+    re.I,
+)
+
+def expand_query(q: str) -> str:
+    ql = q.lower().strip()
+    # Для однословных — не расширяем, чтобы не размывать смысл
+    if len(re.findall(r"\w+", ql)) <= 1:
+        return ql
+    extra = []
+    for pat, syns in {
+        r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
+        r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
+        r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
+        r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
+        r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
+    }.items():
+        if re.search(pat, ql):
+            extra += syns
+    if extra:
+        ql = ql + " " + " ".join(sorted(set(extra)))
+    return ql
+
+def is_promotional(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return bool(CASINO_CTX.search(t) and PROMO_POS.search(t) and not PROMO_NEG.search(t))
+
 SPAM_NEG = re.compile(
     r"(free\s*movies?|tv\s*shows?|stream|прям(ая|ые)\s*трансляц|расписани[ея]|schedule|fixtures|"
     r"live\s*score|match|vs\s|лига|серия\s*a|серия\s*b|кубак?|epl|la\s*liga|bundesliga|"
     r"прогноз(ы)?\s*на\s*матч|ставк(и|а)\s*на\s*спорт|коэфф(ициент)?|odds|parlay)",
     re.I
 )
-
-
-def expand_query(q: str) -> str:
-    ql = q.lower()
-    extra = []
-    for pat, syns in SYNONYMS.items():
-        if re.search(pat, ql):
-            extra += syns
-    if extra:
-        q = q + " " + " ".join(sorted(set(extra)))
-    return q
-
-def is_promotional(text: str) -> bool:
-    if not text: return False
-    t = text.lower()
-    return bool(PROMO_POS.search(t)) and not bool(PROMO_NEG.search(t))
 
 def is_spammy(text: str) -> bool:
     if not text: return False
@@ -590,11 +561,11 @@ def normalize_query_for_hash(q: str) -> str:
 def qhash(q: str) -> str:
     return hashlib.md5(normalize_query_for_hash(q).encode("utf-8")).hexdigest()
 
-# ---------- Intent detection (affiliate / casino / jobs / generic) ----------
+# ---------- Intent detection ----------
 AFFILIATE_INCLUDE = [
     "affiliate","affiliates","aff","арбитраж","арбитраж трафика","партнерка","партнёрка",
-    "кэп", "кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
-    "media buying","buying","тимлид","сетка","сетка офферов","сеть офферов",
+    "кэп","кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
+    "media buying","buying","тимлид","сетка","сеть офферов",
     "traffic","трафик","nutra","gambling","беттинг","игорка","casino affiliate"
 ]
 AFFILIATE_EXCLUDE = [
@@ -605,8 +576,12 @@ AFFILIATE_EXCLUDE = [
 JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","team lead","junior","middle","senior"]
 JOBS_EXCLUDE = []
 
-CASINO_PROMO_INCLUDE = ["free spins","фриспины","бонус","промокод","no deposit","бездеп","cashback","кэшбек","welcome"]
-CASINO_PROMO_EXCLUDE = ["ваканс","job","affiliate","арбитраж","партнерк"]
+CASINO_PROMO_INCLUDE = [
+    "casino","казино","gambling","slots","слоты","игровые автоматы",
+    "roulette","blackjack","poker","букмекер","ставки","betting","freebet","free bet",
+    "free spins","фриспины","промокод","бездеп","no deposit","welcome bonus","cashback","кэшбек"
+]
+CASINO_PROMO_EXCLUDE = ["ваканс","vacancy","job","hiring","affiliate","арбитраж","партнерк","revshare","cpa"]
 
 def detect_intent(q: str):
     ql = q.lower()
@@ -615,9 +590,8 @@ def detect_intent(q: str):
         return dict(name="affiliate", include=AFFILIATE_INCLUDE, exclude=AFFILIATE_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
     if anyw(["ваканс","vacancy","job","работа","hiring"]):
         return dict(name="jobs", include=JOBS_INCLUDE, exclude=JOBS_EXCLUDE, strict=False, boost=0.25, penalty=0.0)
-    if anyw(["casino","казино","фриспин","free spins","бонус","промокод"]):
-        return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=False, boost=0.25, penalty=0.15)
-    # generic
+    if anyw(["casino","казино","фриспин","free spins","бонус","промокод","gambling","slots","слоты"]):
+        return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
     return dict(name="generic", include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
 
 # ============================== Live helpers (Telegram) ==============================
@@ -631,14 +605,8 @@ def make_links(username: Optional[str], message_id: Optional[int]):
 def channels_only(chats: Iterable) -> list[Channel]:
     return [c for c in chats if isinstance(c, Channel) and getattr(c,"username",None)]
 
-
-
-# ============================== Upserts (с подсчётом) ==============================
+# ============================== Upserts ==============================
 async def upsert_channel(conn, chat_id, username, title, typ) -> bool:
-    """
-    Возвращает True если канал НОВЫЙ (вставлен), False если уже был.
-    При отсутствии вставки — всё равно обновляем мету.
-    """
     inserted = await conn.fetchval("""
         INSERT INTO channels(chat_id, username, title, type)
         VALUES($1,$2,$3,$4)
@@ -646,7 +614,6 @@ async def upsert_channel(conn, chat_id, username, title, typ) -> bool:
         RETURNING 1
     """, chat_id, username, title, typ)
     if not inserted:
-        # обновим метаданные (мог поменяться username/title/type)
         await conn.execute("""
             UPDATE channels
             SET username=$2, title=$3, type=$4
@@ -656,9 +623,6 @@ async def upsert_channel(conn, chat_id, username, title, typ) -> bool:
     return True
 
 async def upsert_message(conn, row) -> bool:
-    """
-    Возвращает True если сообщение НОВОЕ (вставлено), False если уже было.
-    """
     inserted = await conn.fetchval("""
         INSERT INTO messages(chat_id, message_id, date, text, has_media, links, views, forwards)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
@@ -670,11 +634,8 @@ async def upsert_message(conn, row) -> bool:
 
 # ============================== Live operations ==============================
 async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
-  
     if _flood_blocked():
         return []
-
-    
     try:
         await asyncio.sleep(0.15 + random.random() * 0.25)
         res = await cli(SearchRequest(q=query, limit=limit))
@@ -687,7 +648,6 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
     except RPCError:
         pass
 
-    
     try:
         other = await SESS_POOL.client()
         async with other:
@@ -702,15 +662,8 @@ async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -
     except RPCError:
         return []
 
-
-# ============================== Crawler / Queue ==============================
-
-
-
+# ============================== Crawler / Seeds ==============================
 async def crawl_once(seeds: list[str], per_channel: int = 500) -> Tuple[int,int,int]:
-    """
-    Делает «плановый» обход по seed-строкам. Возвращает (new_channels, new_messages, queries_run)
-    """
     if _flood_blocked():
         logging.info(f"Crawler: seeds skipped due to FloodWait; left={flood_left()}s")
         return (0, 0, 0)
@@ -743,59 +696,46 @@ async def _db_counts(conn) -> Tuple[int,int,int]:
     return int(ch_cnt or 0), int(msg_cnt or 0), int(qcnt or 0)
 
 async def crawler_loop():
-    # базовая пауза читается из ENV, но будем её адаптивно растягивать
     base_sleep = max(10, CRAWLER_SLEEP_SECONDS)
     sleep_now = base_sleep
-    max_sleep = max(base_sleep, int(os.getenv("CRAWLER_MAX_SLEEP_SECONDS", "1800")))  # до 30 мин
+    max_sleep = max(base_sleep, int(os.getenv("CRAWLER_MAX_SLEEP_SECONDS", "1800")))
 
     while True:
         try:
-            # Если глобально заблокированы по FloodWait — не трогаем БД вообще
             if _flood_blocked():
                 left = flood_left()
                 logging.info(f"Crawler: FloodWait; sleeping {left}s without touching DB")
                 await asyncio.sleep(max(5, left))
-                # Не увеличиваем sleep_now сверх base — Flood сам регулирует паузу
                 sleep_now = min(sleep_now * 2, max_sleep)
                 continue
 
-            # --- Основная работа ---
-
-            # 1) Очередь username'ов
             ch_add_q, msg_add_q, processed = await crawl_from_queue(
                 per_channel=350, batch=CRAWL_QUEUE_BATCH
             )
             logging.info(f"Crawler: from queue processed={processed}, new_channels={ch_add_q}, new_messages={msg_add_q}")
 
-            # 2) Плановые сиды
             ch_add_s, msg_add_s, qrun = await crawl_once(SEEDS_ALL, per_channel=320)
             logging.info(f"Crawler: seeds queries_run={qrun}, new_channels={ch_add_s}, new_messages={msg_add_s}")
 
             added_total = (ch_add_q + ch_add_s) + (msg_add_q + msg_add_s)
 
-            # --- Адаптивный бэкофф ---
             if added_total == 0 and processed == 0 and qrun == 0:
-                # Совсем не было прогресса — увеличим паузу (экпоненциально, но с потолком)
                 sleep_now = min(sleep_now * 2, max_sleep)
                 logging.info(f"Crawler: no progress, backoff sleep={sleep_now}s")
             else:
-                # Был прогресс — возвращаемся к базовой паузе
                 sleep_now = base_sleep
 
         except Exception as e:
             logging.error(f"Crawler error: {e}")
-            # При ошибке чуть подрастим паузу, чтобы не долбить
             sleep_now = min(max(30, int(sleep_now * 1.5)), max_sleep)
 
         await asyncio.sleep(sleep_now)
 
 async def auto_seeder_loop():
-    # выключатель
     if not AUTO_SEED_ENABLED:
         logging.info("Auto-seeder: disabled (AUTO_SEED_ENABLED=0)")
         return
 
-    # список URL из ENV (через запятую), без дублей и пустых
     urls = [u.strip() for u in (AUTO_SEED_SOURCES or "").split(",") if u.strip()]
     urls = list(dict.fromkeys(urls))
     if not urls:
@@ -804,7 +744,6 @@ async def auto_seeder_loop():
 
     logging.info(f"Auto-seeder: enabled; {len(urls)} sources; every {AUTO_SEED_INTERVAL_SEC}s")
 
-    # нормальные заголовки и общий таймаут сессии
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -828,7 +767,6 @@ async def auto_seeder_loop():
             ) as session:
 
                 for url in urls:
-                    # лёгкая пауза между запросами + джиттер
                     await asyncio.sleep(max(0.1, AUTO_SEED_PER_URL_DELAY) + random.random() * 0.5)
 
                     try:
@@ -846,16 +784,13 @@ async def auto_seeder_loop():
                             except Exception:
                                 text = content.decode("latin-1", errors="ignore")
 
-                        # вытащить username-ы из сырого HTML/текста
                         unames = extract_usernames_from_any_text(text)
                         if not unames:
                             logging.info(f"Auto-seeder: no usernames found in {url}")
                             continue
 
                         async with pool.acquire() as conn:
-                            # 1) мгновенно фиксируем все имена в staging-таблицу
                             staged = await upsert_external_usernames(conn, unames, source=url)
-                            # 2) плюс — ставим в очередь для MTProto-краулера
                             await push_usernames_to_queue(conn, unames)
 
                             total_queued += len(unames)
@@ -871,7 +806,6 @@ async def auto_seeder_loop():
         except Exception as e:
             logging.error(f"Auto-seeder loop error: {e}")
 
-        # пауза до следующего цикла
         await asyncio.sleep(max(60, AUTO_SEED_INTERVAL_SEC))
 
 # ============================== Common search helpers ==============================
@@ -940,27 +874,27 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
         WHERE m.date >= $2
           AND ($3::text IS NULL OR lower(c.username)=lower($3))
           AND ($4::bool IS FALSE OR c.username IS NOT NULL)
-          AND length(coalesce(m.text,'')) >= 5 -- убираем совсем пустые/мусорные
+          AND length(coalesce(m.text,'')) >= 5
          AND (
-         to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
+              to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
                 || websearch_to_tsquery('russian', $1))
-             OR
-                to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
-                 || websearch_to_tsquery('english', $1))
-             OR
-           similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
-              OR
-             EXISTS (
+           OR to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
+                || websearch_to_tsquery('english', $1))
+           OR similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
+           OR EXISTS (
                  SELECT 1 FROM unnest($5::text[]) AS t
                  WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
-                 )
-             )
-            AND (NOT $8::bool OR ( (cardinality($6::text[]) = 0 OR EXISTS (
+           )
+         )
+         AND (NOT $8::bool OR (
+              (cardinality($6::text[]) = 0 OR EXISTS (
                    SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-              )) AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
-              SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-              ))  ))
-            ),
+              ))
+              AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
+                   SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+              ))
+         ))
+        ),
         scored AS (
         SELECT m2.*,
               ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
@@ -970,13 +904,12 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
                  AS ft_score,
                 md5(m2.norm) AS norm_hash
             FROM m2
-                )
-            SELECT DISTINCT ON (chat_id, norm_hash)
+        )
+        SELECT DISTINCT ON (chat_id, norm_hash)
             chat_id, username, title, message_id, date, text, views, forwards, ft_score
         FROM scored
-        -- для одинаковых chat_id+norm оставляем более свежую и “интересную”
         ORDER BY chat_id, norm_hash, date DESC, views DESC
-            LIMIT 2000
+        LIMIT 2000
         """, q2, since, chat, only_public, toks, inc, exc, strict, boost, penalty)
 
     now = datetime.now(timezone.utc)
@@ -1025,7 +958,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     boost = float(intent.get("boost", 0.0))
     penalty = float(intent.get("penalty", 0.0))
 
-    # 1) По сообщениям (с intent-сигналами)
     rows_msg = await conn.fetch(r"""
     WITH cand AS (
       SELECT m.chat_id, m.date, m.text, m.views, m.forwards,
@@ -1067,12 +999,11 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     SELECT *
     FROM agg
     WHERE ($6::bool IS FALSE OR username IS NOT NULL)
-      AND (NOT $7::bool OR (incl_hits > 0 AND excl_hits = 0))
+      AND (NOT $7::bool OR (incl_hits >= 2 AND excl_hits = 0))
     ORDER BY last_post DESC
     LIMIT 1000
     """, q2, since, inc, exc, toks, only_public, strict)
 
-    # 2) По названию/username
     rows_meta = await conn.fetch(r"""
     SELECT chat_id, username, title, NOW()::timestamptz AS last_post,
            0::bigint AS hits, 0::bigint AS views_sum, 0::bigint AS fw_sum,
@@ -1122,7 +1053,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
 
     out = list(out_map.values())
 
-    # фильтры по последним 30 сообщениям
     if only_promo or no_spam:
         filtered = []
         for ch in out:
@@ -1153,11 +1083,10 @@ async def status():
         msg_cnt = await conn.fetchval("SELECT count(*) FROM messages")
         last_dt = await conn.fetchval("SELECT max(date) FROM messages")
         qcnt    = await conn.fetchval("SELECT count(*) FROM crawl_queue")
-        # новое: сколько уже зафиксировано в staging-таблице из внешних источников
         try:
             ext_cnt = await conn.fetchval("SELECT count(*) FROM external_usernames")
         except Exception:
-            ext_cnt = None  # если таблица ещё не создана
+            ext_cnt = None
 
     return {
         "channels": int(ch_cnt or 0),
@@ -1203,13 +1132,6 @@ async def queue_add(usernames: str = Query(..., description="comma-separated @us
 
 @app.post("/queue/seed")
 async def queue_seed(body: dict):
-    """
-    Принимает JSON вида:
-    {
-      "usernames": ["ch1","@ch2","https://t.me/ch3", "..."]
-    }
-    Ставит в очередь валидные имена (в нижнем регистре), без дублей.
-    """
     raw = body.get("usernames") or []
     if not isinstance(raw, list):
         return {"ok": False, "error": "field 'usernames' must be a list"}
@@ -1255,7 +1177,6 @@ async def search_messages(
 
     pool = await db()
     async with pool.acquire() as conn:
-        # LIVE накрутка базы перед выдачей
         if live and not _flood_blocked():
             try:
                 async with (await SESS_POOL.client()) as cli:
@@ -1365,7 +1286,6 @@ async def main():
     loop = asyncio.get_running_loop()
     await check_session()
 
-    # заранее: стартовые username — в очередь
     if START_USERNAMES:
         pool = await db()
         async with pool.acquire() as conn:
