@@ -148,15 +148,15 @@ CREATE INDEX IF NOT EXISTS ix_external_sources_gin ON external_usernames USING G
 async def db():
     global _db_pool
     if _db_pool is None:
-       _db_pool = await asyncpg.create_pool(
-             dsn=PG_DSN,
-             min_size=0,
-             max_size=5,
-             max_inactive_connection_lifetime=30.0,
-             timeout=30.0,
-            )
+        _db_pool = await asyncpg.create_pool(
+            dsn=PG_DSN,
+            min_size=0,
+            max_size=5,
+            max_inactive_connection_lifetime=30.0,
+            timeout=30.0,
+        )
     async with _db_pool.acquire() as c:
-            await c.execute(DDL)
+        await c.execute(DDL)
     return _db_pool
 
 # ============================== Helpers ==============================
@@ -224,14 +224,11 @@ def extract_usernames_from_any_text(raw: str) -> List[str]:
     if not raw:
         return []
     found = set()
-
     pat_links = re.compile(r"(?:@|https?://t\.me/)([A-Za-z0-9_]{4,32})", re.I)
     found |= {m.group(1).lower() for m in pat_links.finditer(raw)}
-
     simple = {x.lower() for x in re.findall(r"\b[A-Za-z0-9_]{4,32}\b", raw)}
     blacklist = {"joinchat", "addstickers", "socks", "iv", "share", "proxy"}
     found |= (simple - blacklist)
-
     return [u for u in found if _is_valid_uname(u)]
 
 async def drop_bad_usernames(conn, usernames: List[str]):
@@ -272,12 +269,8 @@ _PER_SESSION_COOLDOWN = float(os.getenv("PER_SESSION_COOLDOWN", "8"))
 async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
     max_tries = tries or len(SESS_LIST)
     last_wait: Optional[int] = None
-    used_sessions: list[int] = []
-
     for i in range(max_tries):
         sess_idx = SESS_POOL.idx % len(SESS_LIST)
-        used_sessions.append(sess_idx)
-
         now = time.time()
         next_ok = _BACKOFF_BY_SESSION.get(sess_idx, 0.0)
         if now < next_ok:
@@ -286,7 +279,6 @@ async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
         cli = await SESS_POOL.client()
         try:
             await asyncio.sleep(_MIN_ROTATION_DELAY + random.random() * _JITTER_MAX)
-
             async with cli:
                 ent = await cli.get_entity(uname)
                 return ent
@@ -296,21 +288,42 @@ async def resolve_entity_with_rotation(uname: str, tries: Optional[int] = None):
             last_wait = sec
             _set_flood_block(sec)
             _BACKOFF_BY_SESSION[sess_idx] = time.time() + max(_PER_SESSION_COOLDOWN, min(sec, 180))
-            logging.warning(
-                f"Flood on @{uname} (try {i+1}/{max_tries}), rotate session; block={sec}s; session={sess_idx+1}"
-            )
+            logging.warning(f"Flood on @{uname} (try {i+1}/{max_tries}), rotate; block={sec}s; session={sess_idx+1}")
             continue
-
-        except (UsernameNotOccupiedError, UsernameInvalidError, ValueError) as e:
-            raise e
-
+        except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+            raise
         except RPCError as e:
-            logging.info(f"RPC error on @{uname}: {e!r}, rotate session")
+            logging.info(f"RPC error on @{uname}: {e!r}, rotate")
             continue
-
     raise AllSessionsFlooded(last_wait)
 
 # ============================== Live ops ==============================
+async def upsert_channel(conn, chat_id, username, title, typ) -> bool:
+    inserted = await conn.fetchval("""
+        INSERT INTO channels(chat_id, username, title, type)
+        VALUES($1,$2,$3,$4)
+        ON CONFLICT (chat_id) DO NOTHING
+        RETURNING 1
+    """, chat_id, username, title, typ)
+    if not inserted:
+        await conn.execute("""
+            UPDATE channels
+            SET username=$2, title=$3, type=$4
+            WHERE chat_id=$1
+        """, chat_id, username, title, typ)
+        return False
+    return True
+
+async def upsert_message(conn, row) -> bool:
+    inserted = await conn.fetchval("""
+        INSERT INTO messages(chat_id, message_id, date, text, has_media, links, views, forwards)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (chat_id, message_id) DO NOTHING
+        RETURNING 1
+    """, row["chat_id"], row["message_id"], row["date"], row["text"], row["has_media"],
+         row["links"], row["views"], row["forwards"])
+    return bool(inserted)
+
 async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Channel], days: int, per_channel: int = 250):
     since_dt = datetime.now(timezone.utc) - timedelta(days=max(1, days))
     sem = asyncio.Semaphore(MAX_PARALLEL_CHANNELS)
@@ -359,7 +372,188 @@ async def live_backfill_messages(cli: TelegramClient, conn, channels: list[Chann
     await asyncio.gather(*[_one(ch) for ch in channels], return_exceptions=True)
     return new_channels, new_messages
 
-# ============================== Crawl Queue ==============================
+def channels_only(chats: Iterable) -> list[Channel]:
+    return [c for c in chats if isinstance(c, Channel) and getattr(c,"username",None)]
+
+async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
+    if _flood_blocked():
+        return []
+    try:
+        await asyncio.sleep(0.15 + random.random() * 0.25)
+        res = await cli(SearchRequest(q=query, limit=limit))
+        return channels_only(res.chats)
+    except FloodWaitError as e:
+        sec = int(getattr(e, "seconds", 30) or 30)
+        logging.warning(f"FloodWait {sec}s on SearchRequest (first try)")
+        _set_flood_block(sec)
+        return []
+    except RPCError:
+        pass
+
+    try:
+        other = await SESS_POOL.client()
+        async with other:
+            await asyncio.sleep(0.2 + random.random() * 0.3)
+            res = await other(SearchRequest(q=query, limit=limit))
+            return channels_only(res.chats)
+    except FloodWaitError as e:
+        sec = int(getattr(e, "seconds", 30) or 30)
+        logging.warning(f"FloodWait {sec}s on SearchRequest (second try)")
+        _set_flood_block(sec)
+        return []
+    except RPCError:
+        return []
+
+# ============================== TOPIC SEEDS ==============================
+CASINO_BRANDS = [
+    "1xbet","pin-up","pinnacle","joycasino","vulkan","parimatch","fonbet","leonbets",
+    "bet365","ggbet","melbet","betfair","betway","winline","mostbet","888casino",
+    "pokerstars","partypoker","bet365 casino","unibet","22bet","mr green","lucky streak",
+    "stake","roobet","cloudbet","spinbetter","parimatch casino","playamo","bitstarz",
+]
+
+AFF_NETWORKS = [
+    "cpa", "cpa gambling","affiliate casino","affiliate marketing","revshare","hybrid deal",
+    "apikings","alpha affiliates","leads.su","everad","adsterra","propellerads","leadbit",
+    "clickdealer","maxbounty","awempire","traffic partners","gagarin partners","income access",
+    "bet365 affiliates","parimatch affiliates","pinnacle affiliates","ggbet affiliates",
+]
+
+CASINO_RU = [
+    "казино","онлайн казино","фриспины","бесплатные вращения","бездепозитный бонус","промокод казино",
+    "бонус казино","слоты","игровые автоматы","рулетка","блэкджек","покер","букмекер",
+    "ставки на спорт","беттинг","фрибет",
+]
+
+CASINO_EN = [
+    "casino","gambling","free spins","bonus code","no deposit bonus","slots","slot machines",
+    "roulette","blackjack","poker","bookmaker","betting","freebet",
+]
+
+START_USERNAMES = []
+GENERAL_WIDE_SEEDS = [
+    "marketing","seo","smm","арбитраж трафика","трафик","промокод","скидки","купоны",
+    "партнерская программа","заработок в интернете","рынок рекламы","influencer","контент маркетинг",
+]
+SEEDS_ALL = list(dict.fromkeys(CASINO_BRANDS + AFF_NETWORKS + CASINO_RU + CASINO_EN + GENERAL_WIDE_SEEDS))
+
+# ============================== Search helpers & intent ==============================
+SYNONYMS = {
+    r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
+    r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
+    r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
+    r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
+    r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
+    r"\baffiliate\b": ["aff", "арбитраж", "партнерка", "партнёрка", "revshare", "hybrid", "cpa", "cpa gambling", "affiliate marketing"],
+    r"\bарбитраж\b": ["traffic", "арбитраж трафика", "affiliate", "aff", "cpa"],
+    r"\bпромокод\b": ["bonus code", "promo", "coupon", "код"],
+}
+
+# промо-хинты
+PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп(озит)|депозит\s*бонус|welcome|фриспин|cash\s*back|кэшбек|промо)", re.I)
+PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
+
+# шум: спорт-стримы и т.п.
+SPAM_NEG = re.compile(
+    r"(free\s*movies?|tv\s*shows?|stream|прям(ая|ые)\s*трансляц|расписани[ея]|schedule|fixtures|"
+    r"live\s*score|match|vs\s|лига|серия\s*a|серия\s*b|кубак?|epl|la\s*liga|bundesliga|"
+    r"прогноз(ы)?\s*на\s*матч|ставк(и|а)\s*на\s*спорт|коэфф(ициент)?|odds|parlay)",
+    re.I
+)
+
+# --- явный азартный контент: общий контекст + бренды ---
+CASINO_CTX = re.compile(
+    r"(казин|casino|беттинг|ставк[аи]|букм|слот(ы|ов)?|игров(ой|ые)\s*автомат|рулетк|покер|"
+    r"free\s*spins?|no\s*deposit|promo\s*code|промо-?код|фри[-\s]?спин|бездеп)", re.I
+)
+GAMBLING_BRANDS = [
+    "1xbet","pin[-\s]?up","pinnacle","joycasino","vulkan","parimatch","fonbet","leonbets",
+    "bet365","ggbet","melbet","betfair","betway","winline","mostbet","888casino",
+    "pokerstars","partypoker","unibet","22bet","mr ?green","stake","roobet","cloudbet",
+    "spinbetter","playamo","bitstarz"
+]
+GAMBLING_BRANDS_RE = re.compile(r"|".join(GAMBLING_BRANDS), re.I)
+
+def expand_query(q: str) -> str:
+    ql = q.lower()
+    extra = []
+    for pat, syns in SYNONYMS.items():
+        if re.search(pat, ql):
+            extra += syns
+    if extra:
+        q = q + " " + " ".join(sorted(set(extra)))
+    return q
+
+def is_promotional(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    return bool(PROMO_POS.search(t)) and not bool(PROMO_NEG.search(t))
+
+def is_spammy(text: str) -> bool:
+    if not text: return False
+    return bool(SPAM_NEG.search(text.lower()))
+
+def is_gambling(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    return bool(CASINO_CTX.search(t) or GAMBLING_BRANDS_RE.search(t))
+
+def recency_weight(date: datetime, now: datetime) -> float:
+    age_days = max(0.0, (now - date).total_seconds() / 86400.0)
+    return math.exp(-age_days / 30.0)
+
+def log1p(x: int | float) -> float:
+    try:
+        return math.log1p(max(0.0, float(x)))
+    except Exception:
+        return 0.0
+
+def tokens_for_like(q: str) -> list[str]:
+    toks = re.findall(r"\w+", q.lower())
+    return [t for t in toks if len(t) >= 3][:10]
+
+def normalize_query_for_hash(q: str) -> str:
+    q = q.lower().strip()
+    q = re.sub(r"\s+", " ", q)
+    return q
+
+def qhash(q: str) -> str:
+    return hashlib.md5(normalize_query_for_hash(q).encode("utf-8")).hexdigest()
+
+AFFILIATE_INCLUDE = [
+    "affiliate","affiliates","aff","арбитраж","арбитраж трафика","партнерка","партнёрка",
+    "кэп","кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
+    "media buying","buying","тимлид","сетка","сеть офферов","traffic","трафик","nutra",
+    "gambling","беттинг","игорка","casino affiliate"
+]
+AFFILIATE_EXCLUDE = ["free spins","фриспин","фриспины","промокод","бездеп","депозитный бонус","welcome bonus","ставки на спорт","фрибет"]
+
+JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","team lead","junior","middle","senior"]
+JOBS_EXCLUDE = []
+
+CASINO_PROMO_INCLUDE = ["free spins","фриспины","бонус","промокод","no deposit","бездеп","cashback","кэшбек","welcome"]
+CASINO_PROMO_EXCLUDE = ["ваканс","job","affiliate","арбитраж","партнерк"]
+
+def detect_intent(q: str):
+    ql = q.lower()
+    def anyw(words): return any(w in ql for w in words)
+    if anyw(["affiliate","арбитраж","партнерк","cpa","revshare","hybrid"]):
+        return dict(name="affiliate", include=AFFILIATE_INCLUDE, exclude=AFFILIATE_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
+    if anyw(["ваканс","vacancy","job","работа","hiring"]):
+        return dict(name="jobs", include=JOBS_INCLUDE, exclude=JOBS_EXCLUDE, strict=False, boost=0.25, penalty=0.0)
+    if anyw(["casino","казино","фриспин","free spins","бонус","промокод"]):
+        return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=False, boost=0.25, penalty=0.15)
+    return dict(name="generic", include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
+
+# ============================== Link helpers ==============================
+def make_links(username: Optional[str], message_id: Optional[int]):
+    if not username:
+        return None, None
+    ch = f"https://t.me/{username}"
+    msg = f"{ch}/{message_id}" if message_id else None
+    return ch, msg
+
+# ============================== Crawl / loops ==============================
 async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATCH) -> Tuple[int,int,int]:
     if _flood_blocked():
         logging.info(f"Crawler: queue skipped due to FloodWait; left={flood_left()}s")
@@ -407,16 +601,11 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
                     else:
                         not_channel += 1
                         bad.append(uname)
-
                 except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
                     bad.append(uname)
-
                 except AllSessionsFlooded as e:
-                    logging.warning(
-                        f"All sessions flooded while resolving @{uname}; block={e.seconds or flood_left()}s"
-                    )
+                    logging.warning(f"All sessions flooded while resolving @{uname}; block={e.seconds or flood_left()}s")
                     break
-
                 except FloodWaitError as e:
                     sec = int(getattr(e, "seconds", 30) or 30)
                     _set_flood_block(sec)
@@ -446,223 +635,6 @@ async def crawl_from_queue(per_channel: int = 300, batch: int = CRAWL_QUEUE_BATC
             logging.warning(f"Crawler: FloodWait outside loop, block={sec}s")
             return (0, 0, 0)
 
-# ============================== TOPIC SEEDS ==============================
-CASINO_BRANDS = [
-    "1xbet","pin-up","pinnacle","joycasino","vulkan","parimatch","fonbet","leonbets",
-    "bet365","ggbet","melbet","betfair","betway","winline","mostbet","888casino",
-    "pokerstars","partypoker","bet365 casino","unibet","22bet","mr green","lucky streak",
-    "stake","roobet","cloudbet","spinbetter","parimatch casino","playamo","bitstarz",
-]
-
-AFF_NETWORKS = [
-    "cpa", "cpa gambling","affiliate casino","affiliate marketing","revshare","hybrid deal",
-    "apikings","alpha affiliates","leads.su","everad","adsterra","propellerads","leadbit",
-    "clickdealer","maxbounty","awempire","traffic partners","gagarin partners","income access",
-    "bet365 affiliates","parimatch affiliates","pinnacle affiliates","ggbet affiliates",
-]
-
-CASINO_RU = [
-    "казино","онлайн казино","фриспины","бесплатные вращения","бездепозитный бонус","промокод казино",
-    "бонус казино","слоты","игровые автоматы","рулетка","блэкджек","покер","букмекер",
-    "ставки на спорт","беттинг","фрибет",
-]
-
-CASINO_EN = [
-    "casino","gambling","free spins","bonus code","no deposit bonus","slots","slot machines",
-    "roulette","blackjack","poker","bookmaker","betting","freebet",
-]
-
-START_USERNAMES = [
-    # "ggbet", "parimatchru", "winline",
-]
-
-GENERAL_WIDE_SEEDS = [
-    "marketing","seo","smm","арбитраж трафика","трафик","промокод","скидки","купоны",
-    "партнерская программа","заработок в интернете","рынок рекламы","influencer","контент маркетинг",
-]
-
-SEEDS_ALL = list(dict.fromkeys(CASINO_BRANDS + AFF_NETWORKS + CASINO_RU + CASINO_EN + GENERAL_WIDE_SEEDS))
-
-# ============================== Helpers (scoring & filters) ==============================
-# Жёсткий казино-контекст + промо
-CASINO_CTX = re.compile(
-    r"(казино|casino|gambl\w*|слот(ы|ов)?|slots?|игров(ы|о)е?\s*автомат(ы|ов)?|рулетк|blackjack|покер|букмекер|ставк[аи]|betting|free\s*bet|фрибет)",
-    re.I,
-)
-
-PROMO_POS = re.compile(
-    r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|no\s*deposit|бездеп(озит)?|cash\s*back|кэшбек|welcome|депозит(ный)?\s*бонус)",
-    re.I,
-)
-
-PROMO_NEG = re.compile(
-    r"(мем|шутк|юмор|сарказм|ирони|прикол|"
-    r"сбербанк|тинькофф|монобанк|приватбанк|карта\s*для\s*детей|"
-    r"нова(я)?\s*почт[аы]|nova\s*poshta|почта\s*россии|delivery|доставка|"
-    r"tv\s*shows?|movies?|стрим(инг)?|расписани[ея]|трансляц|матч|лига|schedule|fixtures)",
-    re.I,
-)
-
-def expand_query(q: str) -> str:
-    ql = q.lower().strip()
-    # Для однословных — не расширяем, чтобы не размывать смысл
-    if len(re.findall(r"\w+", ql)) <= 1:
-        return ql
-    extra = []
-    for pat, syns in {
-        r"\bфри[-\s]?спин(ы|ов|а)?\b": ["free spin", "free spins", "фриспин", "спины", "бесплатные вращения"],
-        r"\bбездеп(озит(ный|а)?)?\b": ["без депозита", "no deposit", "бездепозитный", "ND bonus", "no-deposit"],
-        r"\bбонус(ы|ов)?\b": ["bonus", "бонус код", "промокод", "promo code", "промо-код", "cashback", "кэшбек", "вейджер", "wager"],
-        r"\bфриспины\b": ["free spins","спины","бесплатные вращения"],
-        r"\bказино\b": ["casino", "онлайн казино", "slots", "слоты", "игровые автоматы"],
-    }.items():
-        if re.search(pat, ql):
-            extra += syns
-    if extra:
-        ql = ql + " " + " ".join(sorted(set(extra)))
-    return ql
-
-def is_promotional(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return bool(CASINO_CTX.search(t) and PROMO_POS.search(t) and not PROMO_NEG.search(t))
-
-SPAM_NEG = re.compile(
-    r"(free\s*movies?|tv\s*shows?|stream|прям(ая|ые)\s*трансляц|расписани[ея]|schedule|fixtures|"
-    r"live\s*score|match|vs\s|лига|серия\s*a|серия\s*b|кубак?|epl|la\s*liga|bundesliga|"
-    r"прогноз(ы)?\s*на\s*матч|ставк(и|а)\s*на\s*спорт|коэфф(ициент)?|odds|parlay)",
-    re.I
-)
-
-def is_spammy(text: str) -> bool:
-    if not text: return False
-    return bool(SPAM_NEG.search(text.lower()))
-
-def recency_weight(date: datetime, now: datetime) -> float:
-    age_days = max(0.0, (now - date).total_seconds() / 86400.0)
-    return math.exp(-age_days / 30.0)
-
-def log1p(x: int | float) -> float:
-    try:
-        return math.log1p(max(0.0, float(x)))
-    except Exception:
-        return 0.0
-
-def tokens_for_like(q: str) -> list[str]:
-    toks = re.findall(r"\w+", q.lower())
-    return [t for t in toks if len(t) >= 3][:10]
-
-def normalize_query_for_hash(q: str) -> str:
-    q = q.lower().strip()
-    q = re.sub(r"\s+", " ", q)
-    return q
-
-def qhash(q: str) -> str:
-    return hashlib.md5(normalize_query_for_hash(q).encode("utf-8")).hexdigest()
-
-# ---------- Intent detection ----------
-AFFILIATE_INCLUDE = [
-    "affiliate","affiliates","aff","арбитраж","арбитраж трафика","партнерка","партнёрка",
-    "кэп","кеп","ревшар","revshare","hybrid","cpa","lead","offer","оффер",
-    "media buying","buying","тимлид","сетка","сеть офферов",
-    "traffic","трафик","nutra","gambling","беттинг","игорка","casino affiliate"
-]
-AFFILIATE_EXCLUDE = [
-    "free spins","фриспин","фриспины","промокод","бездеп","депозитный бонус","welcome bonus",
-    "ставки на спорт","фрибет"
-]
-
-JOBS_INCLUDE = ["vacancy","ваканси","вакансии","job","работа","ищем","позиция","position","hiring","team lead","junior","middle","senior"]
-JOBS_EXCLUDE = []
-
-CASINO_PROMO_INCLUDE = [
-    "casino","казино","gambling","slots","слоты","игровые автоматы",
-    "roulette","blackjack","poker","букмекер","ставки","betting","freebet","free bet",
-    "free spins","фриспины","промокод","бездеп","no deposit","welcome bonus","cashback","кэшбек"
-]
-CASINO_PROMO_EXCLUDE = ["ваканс","vacancy","job","hiring","affiliate","арбитраж","партнерк","revshare","cpa"]
-
-def detect_intent(q: str):
-    ql = q.lower()
-    def anyw(words): return any(w in ql for w in words)
-    if anyw(["affiliate","арбитраж","партнерк","cpa","revshare","hybrid"]):
-        return dict(name="affiliate", include=AFFILIATE_INCLUDE, exclude=AFFILIATE_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
-    if anyw(["ваканс","vacancy","job","работа","hiring"]):
-        return dict(name="jobs", include=JOBS_INCLUDE, exclude=JOBS_EXCLUDE, strict=False, boost=0.25, penalty=0.0)
-    if anyw(["casino","казино","фриспин","free spins","бонус","промокод","gambling","slots","слоты"]):
-        return dict(name="casino_promo", include=CASINO_PROMO_INCLUDE, exclude=CASINO_PROMO_EXCLUDE, strict=True, boost=0.35, penalty=0.25)
-    return dict(name="generic", include=[], exclude=[], strict=False, boost=0.0, penalty=0.0)
-
-# ============================== Live helpers (Telegram) ==============================
-def make_links(username: Optional[str], message_id: Optional[int]):
-    if not username:
-        return None, None
-    ch = f"https://t.me/{username}"
-    msg = f"{ch}/{message_id}" if message_id else None
-    return ch, msg
-
-def channels_only(chats: Iterable) -> list[Channel]:
-    return [c for c in chats if isinstance(c, Channel) and getattr(c,"username",None)]
-
-# ============================== Upserts ==============================
-async def upsert_channel(conn, chat_id, username, title, typ) -> bool:
-    inserted = await conn.fetchval("""
-        INSERT INTO channels(chat_id, username, title, type)
-        VALUES($1,$2,$3,$4)
-        ON CONFLICT (chat_id) DO NOTHING
-        RETURNING 1
-    """, chat_id, username, title, typ)
-    if not inserted:
-        await conn.execute("""
-            UPDATE channels
-            SET username=$2, title=$3, type=$4
-            WHERE chat_id=$1
-        """, chat_id, username, title, typ)
-        return False
-    return True
-
-async def upsert_message(conn, row) -> bool:
-    inserted = await conn.fetchval("""
-        INSERT INTO messages(chat_id, message_id, date, text, has_media, links, views, forwards)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT (chat_id, message_id) DO NOTHING
-        RETURNING 1
-    """, row["chat_id"], row["message_id"], row["date"], row["text"], row["has_media"],
-         row["links"], row["views"], row["forwards"])
-    return bool(inserted)
-
-# ============================== Live operations ==============================
-async def live_find_channels(cli: TelegramClient, query: str, limit: int = 80) -> list[Channel]:
-    if _flood_blocked():
-        return []
-    try:
-        await asyncio.sleep(0.15 + random.random() * 0.25)
-        res = await cli(SearchRequest(q=query, limit=limit))
-        return channels_only(res.chats)
-    except FloodWaitError as e:
-        sec = int(getattr(e, "seconds", 30) or 30)
-        logging.warning(f"FloodWait {sec}s on SearchRequest (first try)")
-        _set_flood_block(sec)
-        return []
-    except RPCError:
-        pass
-
-    try:
-        other = await SESS_POOL.client()
-        async with other:
-            await asyncio.sleep(0.2 + random.random() * 0.3)
-            res = await other(SearchRequest(q=query, limit=limit))
-            return channels_only(res.chats)
-    except FloodWaitError as e:
-        sec = int(getattr(e, "seconds", 30) or 30)
-        logging.warning(f"FloodWait {sec}s on SearchRequest (second try)")
-        _set_flood_block(sec)
-        return []
-    except RPCError:
-        return []
-
-# ============================== Crawler / Seeds ==============================
 async def crawl_once(seeds: list[str], per_channel: int = 500) -> Tuple[int,int,int]:
     if _flood_blocked():
         logging.info(f"Crawler: seeds skipped due to FloodWait; left={flood_left()}s")
@@ -876,34 +848,40 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
           AND ($4::bool IS FALSE OR c.username IS NOT NULL)
           AND length(coalesce(m.text,'')) >= 5
          AND (
-              to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
+           to_tsvector('russian', coalesce(m.text,'')) @@ (plainto_tsquery('russian', $1)
                 || websearch_to_tsquery('russian', $1))
-           OR to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
+           OR
+           to_tsvector('english', coalesce(m.text,'')) @@ (plainto_tsquery('english', $1)
                 || websearch_to_tsquery('english', $1))
-           OR similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
-           OR EXISTS (
-                 SELECT 1 FROM unnest($5::text[]) AS t
-                 WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
+           OR
+           similarity(lower(coalesce(m.text,'')), lower($1)) >= 0.20
+           OR
+           EXISTS (
+               SELECT 1 FROM unnest($5::text[]) AS t
+               WHERE lower(coalesce(m.text,'')) ILIKE ('%'||t||'%')
            )
          )
-         AND (NOT $8::bool OR (
-              (cardinality($6::text[]) = 0 OR EXISTS (
-                   SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-              ))
-              AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
-                   SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
-              ))
-         ))
+         AND (
+           NOT $8::bool
+           OR (
+             (cardinality($6::text[]) = 0 OR EXISTS (
+                SELECT 1 FROM unnest($6::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             ))
+             AND NOT (cardinality($7::text[]) > 0 AND EXISTS (
+                SELECT 1 FROM unnest($7::text[]) AS t WHERE lower(coalesce(m.text,'')) ILIKE ('%'||lower(t)||'%')
+             ))
+           )
+         )
         ),
         scored AS (
-        SELECT m2.*,
-              ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
-                   + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
-                   + (CASE WHEN m2.kw_incl THEN $9::float ELSE 0 END)
-                  - (CASE WHEN m2.kw_excl THEN $10::float ELSE 0 END)
-                 AS ft_score,
-                md5(m2.norm) AS norm_hash
-            FROM m2
+          SELECT m2.*,
+            ts_rank_cd(to_tsvector('simple', m2.norm), plainto_tsquery('simple', $1)) * 0.55
+            + similarity(lower(coalesce(m2.text,'')), lower($1)) * 0.45
+            + (CASE WHEN m2.kw_incl THEN $9::float ELSE 0 END)
+            - (CASE WHEN m2.kw_excl THEN $10::float ELSE 0 END)
+          AS ft_score,
+          md5(m2.norm) AS norm_hash
+          FROM m2
         )
         SELECT DISTINCT ON (chat_id, norm_hash)
             chat_id, username, title, message_id, date, text, views, forwards, ft_score
@@ -939,6 +917,10 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
             "snippet": (txt[:280] + "…") if len(txt) > 280 else txt,
             "score": score
         })
+
+    # ⬇️ жестко вырезаем казино-контент для не-казино запросов
+    if intent.get("name") not in ("casino_promo", "affiliate"):
+        items = [it for it in items if not is_gambling(it.get("snippet",""))]
 
     items.sort(key=lambda x: x["score"], reverse=True)
     items = _diversify(items, max_per_channel=max_per_channel)
@@ -999,7 +981,7 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
     SELECT *
     FROM agg
     WHERE ($6::bool IS FALSE OR username IS NOT NULL)
-      AND (NOT $7::bool OR (incl_hits >= 2 AND excl_hits = 0))
+      AND (NOT $7::bool OR (incl_hits > 0 AND excl_hits = 0))
     ORDER BY last_post DESC
     LIMIT 1000
     """, q2, since, inc, exc, toks, only_public, strict)
@@ -1046,27 +1028,26 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
 
     for r in rows_msg:
         put_row(r, meta_boost=False)
-
     for r in rows_meta:
         if int(r["chat_id"]) not in out_map:
             put_row(r, meta_boost=True)
 
     out = list(out_map.values())
 
-    if only_promo or no_spam:
+    # строгий вырез азартных каналов для не-казино запросов
+    if intent.get("name") != "casino_promo":
+        # удаляем по названию
+        out = [ch for ch in out if not is_gambling(f"{ch.get('title','')} {ch.get('chat','')}")]
+        # и по последним сообщениям
         filtered = []
         for ch in out:
-            if not ch["chat_username"]:
-                continue
             ch_id = ch["chat_id"]
             msgs = await conn.fetch("""
                 SELECT text FROM messages WHERE chat_id=$1
-                ORDER BY date DESC LIMIT 30
+                ORDER BY date DESC LIMIT 15
             """, ch_id)
             texts = [m["text"] or "" for m in msgs]
-            if only_promo and not any(is_promotional(t) for t in texts):
-                continue
-            if no_spam and any(is_spammy(t) for t in texts):
+            if any(is_gambling(t) for t in texts):
                 continue
             filtered.append(ch)
         out = filtered
@@ -1175,13 +1156,18 @@ async def search_messages(
     toks = tokens_for_like(q2)
     intent = detect_intent(q)
 
+    # 🔧 Для не-казино/не-affiliate отключаем промо-режим по умолчанию
+    if intent.get("name") not in ("casino_promo", "affiliate"):
+        only_promo = False
+
     pool = await db()
     async with pool.acquire() as conn:
         if live and not _flood_blocked():
             try:
                 async with (await SESS_POOL.client()) as cli:
                     chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 120))
-                    if not chans:
+                    # расширение сидов ТОЛЬКО для казино-запросов
+                    if not chans and intent.get("name") == "casino_promo":
                         widened = list(dict.fromkeys([q] + [q2] + CASINO_BRANDS + AFF_NETWORKS))
                         random.shuffle(widened)
                         for wq in widened[:5]:
@@ -1194,10 +1180,7 @@ async def search_messages(
                         chans = chans[:LIVE_MAX_CHATS]
                         await asyncio.sleep(0.2 + random.random() * 0.4)
                         await live_backfill_messages(
-                            cli,
-                            conn,
-                            chans,
-                            days=days,
+                            cli, conn, chans, days=days,
                             per_channel=min(LIVE_PER_CHANNEL_LIMIT, 160),
                         )
 
@@ -1240,20 +1223,21 @@ async def search_chats(
     toks = tokens_for_like(q2)
     intent = detect_intent(q)
 
+    if intent.get("name") not in ("casino_promo", "affiliate"):
+        only_promo = False
+
     pool = await db()
     async with pool.acquire() as conn:
         if live and not _flood_blocked():
             try:
                 async with (await SESS_POOL.client()) as cli:
                     chans = await live_find_channels(cli, q, limit=min(LIVE_MAX_CHATS, 120))
+                    # НЕ расширяем казино-сиды для обычных тем
                     if chans:
                         chans = chans[:LIVE_MAX_CHATS]
                         await asyncio.sleep(0.2 + random.random() * 0.4)
                         await live_backfill_messages(
-                            cli,
-                            conn,
-                            chans,
-                            days=days,
+                            cli, conn, chans, days=days,
                             per_channel=min(LIVE_KNOWN_PER_CHANNEL, 160),
                         )
             except FloodWaitError as e:
