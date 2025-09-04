@@ -12,7 +12,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, UsernameNotOccupiedError, UsernameInvalidError
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Message, MessageService
-import aiohttp
+import aiohttp  # оставил на будущее для авто-сидера (можно удалить, если не нужен)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -71,7 +71,7 @@ LIVE_KNOWN_PER_CHANNEL = int(os.getenv("LIVE_KNOWN_PER_CHANNEL", "200"))
 CRAWL_QUEUE_BATCH = int(os.getenv("CRAWL_QUEUE_BATCH", "120"))
 MAX_PARALLEL_CHANNELS = int(os.getenv("MAX_PARALLEL_CHANNELS", "6"))
 CRAWLER_SLEEP_SECONDS = int(os.getenv("CRAWLER_SLEEP_SECONDS", "120"))
-AUTO_SEED_ENABLED = os.getenv("AUTO_SEED_ENABLED", "0").lower() in ("1", "true", "yes"))
+AUTO_SEED_ENABLED = os.getenv("AUTO_SEED_ENABLED", "0").lower() in ("1", "true", "yes")  # ← фикс: убрал лишнюю скобку
 AUTO_SEED_SOURCES = os.getenv("AUTO_SEED_SOURCES", "https://tgstat.com/ru/top-channels,https://tgstat.com/ru/categories/news,https://tgstat.com/ru/categories/technology,https://tgstat.com/ru/categories/entertainment,https://tgstat.com/ru/categories/business")
 AUTO_SEED_INTERVAL_SEC = int(os.getenv("AUTO_SEED_INTERVAL_SEC", "21600"))
 AUTO_SEED_PER_URL_DELAY = float(os.getenv("AUTO_SEED_PER_URL_DELAY", "0.7"))
@@ -431,7 +431,7 @@ SYNONYMS = {
 PROMO_POS = re.compile(r"(бонус|free\s*spins?|фри[-\s]?спин|промо-?код|промокод|бездеп|депозит\s*бонус|welcome|фриспин|cash\s*back|кэшбек)", re.I)
 PROMO_NEG = re.compile(r"(мем|шутк|юмор|сарказм|ирони|мемы|прикол)", re.I)
 
-# — явные азартные слова/бренды (для строгой фильтрации и для NEG в generic)
+# азартные слова/бренды
 GAMBLING_WORDS = list(dict.fromkeys(CASINO_BRANDS + CASINO_RU + CASINO_EN + ["freebet","букмекер","bet","slot"]))
 GAMBLING_RE = re.compile("|".join([re.escape(w) for w in sorted(GAMBLING_WORDS, key=len, reverse=True)]), re.I)
 
@@ -487,27 +487,27 @@ def detect_intent(q: str):
     if anyw(["casino","казино","фриспин","free spins","бездеп","промокод","слоты","slots","ставки","беттинг"]):
         return dict(
             name="casino_promo",
-            include=GAMBLING_WORDS,     # обязательно должны встретиться
-            exclude=[],                 # явных исключений нет
-            strict=True,                # включаем строгий предикат в SQL
+            include=GAMBLING_WORDS,
+            exclude=[],
+            strict=True,
             boost=0.35,
             penalty=0.15,
-            sim_threshold=0.22          # можно оставить ниже, т.к. strict отфильтрует
+            sim_threshold=0.22
         )
 
     # вакансии
     if anyw(["ваканс","vacancy","job","работа","hiring"]):
         return dict(name="jobs", include=["вакан","vacancy","job","работ"], exclude=[], strict=False, boost=0.25, penalty=0.0, sim_threshold=0.26)
 
-    # generic: жёстко исключаем азартку и поднимаем порог похожести
+    # generic: жестко исключаем азартку и поднимаем порог похожести
     return dict(
         name="generic",
         include=[],
-        exclude=GAMBLING_WORDS,   # НЕ должно встречаться
-        strict=True,               # т.к. есть exclude — пусть применится строгое правило
+        exclude=GAMBLING_WORDS,
+        strict=True,
         boost=0.0,
         penalty=0.0,
-        sim_threshold=0.30         # выше — меньше случайных совпадений
+        sim_threshold=0.30
     )
 
 # ============================== Live helpers ==============================
@@ -624,16 +624,9 @@ async def crawler_loop():
 
 # ============================== Anti-repeat ==============================
 async def _filter_and_record_antirepeat(conn, user_key: Optional[str], q: str, items: List[dict]) -> Tuple[int, List[dict]]:
-    """
-    Фильтруем повторы:
-      1) Глобально (одно и то же сообщение не показываем чаще, чем TTL).
-      2) По user_key+qhash (если указан user_key).
-    Затем записываем показ глобально и для user_key (если есть).
-    """
     ttl = max(1.0, ANTI_REPEAT_TTL_HOURS)
     now_limit = datetime.now(timezone.utc) - timedelta(hours=ttl)
 
-    # читаем глобальные недавние показы
     recent = await conn.fetch("""
         SELECT chat_id, message_id
         FROM served_hits
@@ -641,7 +634,6 @@ async def _filter_and_record_antirepeat(conn, user_key: Optional[str], q: str, i
     """, GLOBAL_USER_KEY, GLOBAL_QHASH_ALL, now_limit)
     recent_set = {(int(r["chat_id"]), int(r["message_id"])) for r in recent}
 
-    # если есть user_key — готовим множество недавних для конкретного запроса
     user_recent_set = set()
     if user_key:
         h = qhash(q)
@@ -661,7 +653,6 @@ async def _filter_and_record_antirepeat(conn, user_key: Optional[str], q: str, i
                 continue
         filt.append(it)
 
-    # записываем показы (глобально + для user_key, если есть)
     rows_global = [(GLOBAL_USER_KEY, GLOBAL_QHASH_ALL, it.get("chat_id"), it.get("message_id"))
                    for it in filt if it.get("chat_id") and it.get("message_id")]
     if rows_global:
@@ -767,7 +758,6 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
         txt = r["text"] or ""
         if no_spam and is_spammy(txt): continue
         if only_promo and not is_promotional(txt): continue
-        # дополнительно: если запрос НЕ казино — вырежем азартку на всякий
         if intent.get("name") != "casino_promo" and GAMBLING_RE.search(txt or ""):
             continue
         w = recency_weight(r["date"], now)
@@ -785,8 +775,7 @@ async def db_search_messages(conn, q2: str, chat: Optional[str], only_public: bo
             "score": score
         })
 
-    # сортировка + разнообразие + анти-повтор
-    random.shuffle(items)  # лёгкий джиттер против «залипания»
+    random.shuffle(items)
     items.sort(key=lambda x: x["score"], reverse=True)
     items = _diversify(items, max_per_channel=max_per_channel)
     _, items = await _filter_and_record_antirepeat(conn, user_key, q2, items)
@@ -890,7 +879,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
         }
 
     for r in rows_msg:
-        # Дополнительно режем азартку, если запрос не казино
         if intent.get("name") != "casino_promo" and GAMBLING_RE.search(r["text"] or ""):
             continue
         put_row(r, meta_boost=False)
@@ -901,7 +889,6 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
 
     out = list(out_map.values())
 
-    # Доп. фильтр по последним 30 сообщениям
     if only_promo or no_spam or intent.get("name") != "casino_promo":
         filtered = []
         for ch in out:
@@ -916,7 +903,7 @@ async def db_search_chats(conn, q2: str, only_public: bool, since: datetime, tok
             filtered.append(ch)
         out = filtered
 
-    random.shuffle(out)  # чуть разнообразия при равных
+    random.shuffle(out)
     out.sort(key=lambda x: x["score"], reverse=True)
     return {"total": len(out), "items": out[:limit]}
 
@@ -1094,10 +1081,7 @@ async def main():
         logging.info("Starting crawler loop…")
         loop.create_task(crawler_loop())
 
-    if AUTO_SEED_ENABLED:
-        logging.info("Starting auto-seeder loop…")
-        # (оставил твой auto-seeder; можно включить при необходимости)
-        loop.create_task(crawler_loop())  # или свою реализацию
+    # AUTO_SEED_ENABLED оставлен как конфиг-переменная; авто-сидер здесь не запускаем
 
     config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")))
     server = uvicorn.Server(config)
